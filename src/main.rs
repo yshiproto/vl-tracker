@@ -2,6 +2,7 @@
 
 mod config;
 mod henrik_api;
+mod impact;
 mod model;
 mod overlay;
 mod riot_local;
@@ -17,7 +18,7 @@ use eframe::egui::{self, Color32, RichText};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Config;
-use crate::model::{Command, Event, Fetch, IconKey, RankProfile, Roster, Side, Slot, Stats, Status};
+use crate::model::{Command, Event, Fetch, IconKey, Impact, RankProfile, Roster, Side, Slot, Stats, Status};
 use crate::overlay::OverlayState;
 use crate::val_assets::Assets;
 use crate::win32::Hotkey;
@@ -43,6 +44,7 @@ struct PlayerInfo {
     riot_id: Option<String>,
     rank: Fetch<RankProfile>,
     stats: Fetch<Stats>,
+    impact: Fetch<Impact>,
 }
 
 enum Lookup {
@@ -119,6 +121,7 @@ impl App {
             Event::Name { puuid, riot_id } => self.players.entry(puuid).or_default().riot_id = Some(riot_id),
             Event::Rank { puuid, rank } => self.players.entry(puuid).or_default().rank = rank,
             Event::Stats { puuid, stats } => self.players.entry(puuid).or_default().stats = stats,
+            Event::Impact { puuid, impact } => self.players.entry(puuid).or_default().impact = impact,
             Event::Icon { key, image } => {
                 let tex = ctx.load_texture(format!("{key:?}"), image, egui::TextureOptions::LINEAR);
                 self.icons.insert(key, tex);
@@ -241,7 +244,7 @@ impl App {
                     hidden: false,
                     is_self: false,
                 };
-                self.player_grid(ui, "lookup_grid", &[slot], false);
+                self.player_grid(ui, "lookup_grid", &[slot], Columns::Main);
             }
             None => {}
         }
@@ -264,7 +267,7 @@ impl App {
         slots.sort_by_key(|s| !s.is_self);
         if roster.ffa {
             ui.heading("Players");
-            self.player_grid(ui, "ffa_grid", &slots, false);
+            self.player_grid(ui, "ffa_grid", &slots, Columns::Main);
             return;
         }
 
@@ -272,27 +275,25 @@ impl App {
         let pregame = self.status == Status::AgentSelect;
         ui.columns(2, |cols| {
             cols[0].heading("My Team");
-            self.player_grid(&mut cols[0], "ally_grid", &allies, false);
+            self.player_grid(&mut cols[0], "ally_grid", &allies, Columns::Main);
             cols[1].heading("Enemy Team");
             if enemies.is_empty() && pregame {
                 cols[1].label(RichText::new("Enemies are revealed once the match loads.").weak());
             } else {
-                self.player_grid(&mut cols[1], "enemy_grid", &enemies, false);
+                self.player_grid(&mut cols[1], "enemy_grid", &enemies, Columns::Main);
             }
         });
     }
 
-    fn player_grid(&mut self, ui: &mut egui::Ui, id: &str, slots: &[Slot], extended: bool) {
-        self.grouped_grid(ui, id, &[("", slots)], extended);
+    fn player_grid(&mut self, ui: &mut egui::Ui, id: &str, slots: &[Slot], columns: Columns) {
+        self.grouped_grid(ui, id, &[("", slots)], columns);
     }
 
-    /// One grid so columns align across groups; a non-empty title adds a heading row before its
-    /// group. `extended` adds win rate, ACS and ADR (used by the overlay scoreboard).
-    fn grouped_grid(&mut self, ui: &mut egui::Ui, id: &str, groups: &[(&str, &[Slot])], extended: bool) {
-        let headers: &[&str] = if extended {
-            &["", "", "Riot ID", "Rank", "K/D", "HS%", "WR", "ACS", "ADR"]
-        } else {
-            &["", "", "Riot ID", "Rank", "K/D", "HS%"]
+    /// One grid so columns align across groups; a non-empty title adds a heading row before its group.
+    fn grouped_grid(&mut self, ui: &mut egui::Ui, id: &str, groups: &[(&str, &[Slot])], columns: Columns) {
+        let headers: &[&str] = match columns {
+            Columns::Main => &["", "", "Riot ID", "Rank", "Impact", "K/D", "HS%"],
+            Columns::Scoreboard => &["", "", "Riot ID", "Rank", "K/D", "HS%", "WR", "ACS", "ADR"],
         };
         egui::Grid::new(id).striped(true).num_columns(headers.len()).spacing([10.0, 4.0]).show(ui, |ui| {
             for (title, slots) in groups {
@@ -308,14 +309,14 @@ impl App {
                 }
                 ui.end_row();
                 for slot in *slots {
-                    self.player_row(ui, slot, extended);
+                    self.player_row(ui, slot, columns);
                     ui.end_row();
                 }
             }
         });
     }
 
-    fn player_row(&mut self, ui: &mut egui::Ui, slot: &Slot, extended: bool) {
+    fn player_row(&mut self, ui: &mut egui::Ui, slot: &Slot, columns: Columns) {
         let agent_tex = slot.agent.clone().and_then(|a| self.icon(IconKey::Agent(a)));
         let rank = self.players.get(&slot.puuid).map(|p| p.rank.clone()).unwrap_or_default();
         let rank_tex = match &rank {
@@ -336,7 +337,11 @@ impl App {
             };
             ui.label(RichText::new(text).italics().weak())
                 .on_hover_text("This player hid their name; their profile is not looked up.");
-            for _ in 0..if extended { 6 } else { 3 } {
+            let blanks = match columns {
+                Columns::Main => 4,
+                Columns::Scoreboard => 6,
+            };
+            for _ in 0..blanks {
                 ui.label(RichText::new("—").weak());
             }
             return;
@@ -348,6 +353,10 @@ impl App {
         ui.label(name);
 
         fetch_cell(ui, &rank, |_| self.rank_text(&rank));
+        if columns == Columns::Main {
+            let impact = info.map(|p| p.impact.clone()).unwrap_or_default();
+            impact_cell(ui, &impact);
+        }
         let stats = info.map(|p| p.stats.clone()).unwrap_or_default();
         let hover = match &stats {
             Fetch::Ready(s) => Some(format!("Last {} competitive matches", s.matches)),
@@ -357,7 +366,7 @@ impl App {
             fetch_cell(ui, &stats, |s| format!("{:.2}", s.kd)),
             fetch_cell(ui, &stats, |s| format!("{:.0}%", s.hs_pct)),
         ];
-        if extended {
+        if columns == Columns::Scoreboard {
             cells.push(fetch_cell(ui, &stats, |s| {
                 format!("{:.0}%", s.wins as f32 * 100.0 / (s.wins + s.losses).max(1) as f32)
             }));
@@ -378,6 +387,40 @@ fn icon_cell(ui: &mut egui::Ui, tex: Option<egui::TextureId>, tint: Color32) {
         Some(id) => ui.add(egui::Image::new(egui::load::SizedTexture::new(id, size)).tint(tint)),
         None => ui.allocate_exact_size(size, egui::Sense::hover()).1,
     };
+}
+
+/// Which stat columns a player grid shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Columns {
+    /// Main window: includes the impact rating.
+    Main,
+    /// Overlay scoreboard: adds win rate, ACS and ADR.
+    Scoreboard,
+}
+
+/// Label and colour for a 1.00-centred impact rating.
+fn impact_label(rating: f32) -> (&'static str, Color32) {
+    match rating {
+        r if r >= 1.20 => ("Carry", Color32::from_rgb(90, 210, 120)),
+        r if r >= 1.07 => ("Strong", Color32::from_rgb(150, 210, 110)),
+        r if r > 0.93 => ("Neutral", Color32::from_gray(200)),
+        r if r > 0.80 => ("Weak", Color32::from_rgb(230, 170, 90)),
+        _ => ("Liability", Color32::from_rgb(230, 110, 100)),
+    }
+}
+
+fn impact_cell(ui: &mut egui::Ui, impact: &Fetch<Impact>) {
+    let Fetch::Ready(i) = impact else {
+        fetch_cell(ui, impact, |_| String::new());
+        return;
+    };
+    let (label, color) = impact_label(i.rating);
+    ui.label(RichText::new(format!("{:.2}", i.rating)).color(color).strong()).on_hover_text(format!(
+        "{label}: {:+.1}% round-win probability per round over {} rounds (last {} competitive matches)",
+        i.wpa_per_round * 100.0,
+        i.rounds,
+        i.matches
+    ));
 }
 
 fn fetch_cell<T>(ui: &mut egui::Ui, value: &Fetch<T>, show: impl FnOnce(&T) -> String) -> egui::Response {

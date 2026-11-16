@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
 use crate::henrik_api::{Account, Henrik};
+use crate::impact::{self, WinModel};
 use crate::model::{Command, Error, Event, Fetch, IconKey, Result, Roster, Status, UiSink};
 use crate::riot_local::{LogTail, Lockfile, LoopState, RiotSession};
 use crate::val_assets::{self, Assets};
@@ -80,6 +81,8 @@ struct Worker {
     /// Everything remote, with normal certificate verification.
     remote: reqwest::Client,
     henrik: Arc<Henrik>,
+    /// Shared by player jobs; learns from every match fetched and persists to disk.
+    win_model: Arc<std::sync::Mutex<WinModel>>,
     assets: Option<Arc<Assets>>,
     assets_retry_at: Instant,
     icons_waiting: Vec<IconKey>,
@@ -112,6 +115,7 @@ impl Worker {
         Ok(Self {
             ui,
             henrik: Arc::new(Henrik::new(remote.clone(), api_key)),
+            win_model: Arc::new(std::sync::Mutex::new(WinModel::load())),
             local,
             remote,
             assets: None,
@@ -362,6 +366,7 @@ impl Worker {
         let job = PlayerJob {
             session: self.session.clone(),
             henrik: self.henrik.clone(),
+            win_model: self.win_model.clone(),
             ui: self.ui.clone(),
             puuid: puuid.to_owned(),
             region: region.to_owned(),
@@ -447,6 +452,7 @@ impl Worker {
 struct PlayerJob {
     session: Option<Arc<RiotSession>>,
     henrik: Arc<Henrik>,
+    win_model: Arc<std::sync::Mutex<WinModel>>,
     ui: UiSink,
     puuid: String,
     region: String,
@@ -479,6 +485,22 @@ impl PlayerJob {
         let stats = self.henrik.stats(&self.region, &self.puuid).await;
         transient |= stats.as_ref().is_err_and(Error::is_transient);
         self.ui.send(Event::Stats { puuid: self.puuid.clone(), stats: Fetch::from(stats) });
+
+        // Teammates are scheduled during agent select and enemies once the match loads, so this
+        // naturally fetches teammates first.
+        let impact = match self.henrik.recent_matches(&self.region, &self.puuid).await {
+            Ok(matches) => {
+                let mut model = self.win_model.lock().unwrap_or_else(|e| e.into_inner());
+                model.ingest(&matches);
+                let impact = impact::evaluate(&matches, &self.puuid, &mut model).ok_or(Error::NotFound);
+                // Persistence is best effort: a failed write only loses what this session learned.
+                let _ = model.save();
+                impact
+            }
+            Err(e) => Err(e),
+        };
+        transient |= impact.as_ref().is_err_and(Error::is_transient);
+        self.ui.send(Event::Impact { puuid: self.puuid.clone(), impact: Fetch::from(impact) });
 
         TaskDone::Player { puuid: self.puuid, ok: !transient }
     }

@@ -11,9 +11,9 @@
 use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, RichText, Sense, Vec2, ViewportId};
 
 use crate::config::OverlayConfig;
-use crate::model::{Fetch, IconKey, RankProfile, Side, Slot, Status};
+use crate::model::{Fetch, IconKey, Impact, RankProfile, Side, Slot, Status};
 use crate::win32::{self, Hotkey};
-use crate::{App, PlayerInfo};
+use crate::{App, Columns, PlayerInfo, impact_label};
 
 const BOX_SIZE: Vec2 = Vec2::new(250.0, 58.0);
 const CARD_WIDTH: f32 = 300.0;
@@ -247,7 +247,7 @@ impl App {
                     } else {
                         &[("My Team", &allies), ("Enemy Team", &enemies)]
                     };
-                    self.grouped_grid(ui, "scoreboard_grid", groups, true);
+                    self.grouped_grid(ui, "scoreboard_grid", groups, Columns::Scoreboard);
                 });
             });
         vec![resp.response.rect]
@@ -343,7 +343,22 @@ impl App {
                 ui.label(RichText::new(self.rank_text(&rank)).small());
             });
         });
-        ui.label(RichText::new(stats_line(info)).small());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            match info.map(|p| &p.impact) {
+                Some(Fetch::Ready(i)) => {
+                    let (_, color) = impact_label(i.rating);
+                    ui.label(RichText::new(format!("Impact {:.2}", i.rating)).small().strong().color(color));
+                }
+                Some(Fetch::Unavailable(_)) => {
+                    ui.label(RichText::new("Impact —").small().weak());
+                }
+                Some(Fetch::Pending) | None => {
+                    ui.label(RichText::new("Impact …").small().weak());
+                }
+            }
+            ui.label(RichText::new(stats_line(info)).small());
+        });
     }
 
     fn detail_card(&mut self, ui: &mut egui::Ui, slot: &Slot) {
@@ -357,6 +372,17 @@ impl App {
             && let Some((tier, act)) = self.peak(profile)
         {
             ui.label(format!("Peak: {} ({act})", self.tier_label(tier)));
+        }
+
+        ui.add_space(4.0);
+        match info.map(|p| p.impact.clone()).unwrap_or_default() {
+            Fetch::Ready(i) => impact_section(ui, &i),
+            Fetch::Pending => {
+                ui.label(RichText::new("Calculating impact from the last 5 matches…").weak());
+            }
+            Fetch::Unavailable(reason) => {
+                ui.label(RichText::new(format!("Impact unavailable: {reason}")).weak());
+            }
         }
 
         ui.add_space(4.0);
@@ -453,14 +479,62 @@ fn act_label(app: &App, act: &str) -> String {
     app.assets.as_ref().and_then(|a| a.acts.get(act)).map_or_else(|| "Unknown act".into(), |a| a.label.clone())
 }
 
+fn impact_section(ui: &mut egui::Ui, i: &Impact) {
+    let (label, color) = impact_label(i.rating);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Impact {:.2}", i.rating)).strong().size(15.0).color(color));
+        ui.label(RichText::new(label).color(color));
+    });
+    ui.label(
+        RichText::new(format!(
+            "{:+.1}% round-win probability per round · {} rounds, last {} competitive",
+            i.wpa_per_round * 100.0,
+            i.rounds,
+            i.matches
+        ))
+        .small()
+        .weak(),
+    );
+    ui.label(format!(
+        "Opening duels {}–{} · KAST {:.0}% · Clutches {}/{}",
+        i.opening_wins,
+        i.opening_losses,
+        i.kast * 100.0,
+        i.clutches_won,
+        i.clutches
+    ));
+    let traded = i.deaths_traded as f32 * 100.0 / i.deaths.max(1) as f32;
+    ui.label(format!("Trade kills {} · Deaths traded {traded:.0}%", i.trade_kills));
+    if i.kills > 0 {
+        let low = i.low_impact_kills as f32 * 100.0 / i.kills as f32;
+        ui.label(format!("Low-impact kills {low:.0}% of {}", i.kills))
+            .on_hover_text("Kills that moved round-win odds by under 3 points: exit frags, eco kills, …");
+    }
+    if let Some(note) = impact_note(i) {
+        ui.label(RichText::new(note).italics().color(color));
+    }
+}
+
+/// Calls out where the scoreboard and the impact disagree.
+fn impact_note(i: &Impact) -> Option<&'static str> {
+    let kd = i.kills as f32 / i.deaths.max(1) as f32;
+    let low_share = i.low_impact_kills as f32 / i.kills.max(1) as f32;
+    if kd >= 1.10 && i.rating < 0.95 {
+        Some("Kills aren't turning into rounds won")
+    } else if kd < 0.95 && i.rating >= 1.07 {
+        Some("Wins rounds beyond what K/D shows")
+    } else if i.kills >= 10 && low_share >= 0.40 {
+        Some("Many kills come after the round is decided or against weaker buys")
+    } else {
+        None
+    }
+}
+
 fn stats_line(info: Option<&PlayerInfo>) -> String {
     match info.map(|p| &p.stats) {
-        Some(Fetch::Ready(s)) => {
-            let decided = (s.wins + s.losses).max(1);
-            format!("K/D {:.2} · HS {:.0}% · WR {:.0}%", s.kd, s.hs_pct, s.wins as f32 * 100.0 / decided as f32)
-        }
-        Some(Fetch::Unavailable(reason)) => format!("Stats: {reason}"),
-        Some(Fetch::Pending) | None => "Loading stats…".into(),
+        Some(Fetch::Ready(s)) => format!("· K/D {:.2} · HS {:.0}%", s.kd, s.hs_pct),
+        Some(Fetch::Unavailable(reason)) => format!("· stats: {reason}"),
+        Some(Fetch::Pending) | None => "· loading stats…".into(),
     }
 }
 

@@ -4,6 +4,12 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Machine-local data (icon cache, win-probability model): `%LOCALAPPDATA%\vltracker`.
+pub fn local_data_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("XDG_CACHE_HOME"))?;
+    Some(PathBuf::from(base).join("vltracker"))
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]

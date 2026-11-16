@@ -227,14 +227,14 @@ fn title_case(s: &str) -> String {
 }
 
 fn icon_cache_path(url: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("XDG_CACHE_HOME"))?;
+    let base = crate::config::local_data_dir()?;
     // URLs embed the asset UUID, so a changed asset gets a new file automatically.
     let file: String = url
         .trim_start_matches("https://")
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
         .collect();
-    Some(PathBuf::from(base).join("vltracker").join("icons").join(file))
+    Some(base.join("icons").join(file))
 }
 
 /// Returns a small RGBA icon, downloading and shrinking it on first use.

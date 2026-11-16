@@ -85,6 +85,32 @@ pub struct Stats {
     pub adr: f32,
 }
 
+/// Contribution to winning rounds over a player's recent competitive matches, from
+/// win-probability added (WPA): each kill, death, plant and defuse is credited with how much it
+/// moved the round-win probability.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Impact {
+    /// 1.00 = break-even; ±0.15 ≈ one standard deviation across players seen.
+    pub rating: f32,
+    /// Round-win probability added per round, shrunk toward 0 for small samples (0.023 = +2.3%).
+    pub wpa_per_round: f32,
+    pub rounds: u32,
+    pub matches: u32,
+    pub kills: u32,
+    pub deaths: u32,
+    pub opening_wins: u32,
+    pub opening_losses: u32,
+    /// Share of rounds with a kill, assist, survival, or traded death.
+    pub kast: f32,
+    /// Kills that avenged a teammate within the trade window.
+    pub trade_kills: u32,
+    pub deaths_traded: u32,
+    pub clutches: u32,
+    pub clutches_won: u32,
+    /// Kills that moved round-win probability by under 3 points (exit frags, eco kills, …).
+    pub low_impact_kills: u32,
+}
+
 /// Per-field load state so each cell renders independently.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub enum Fetch<T> {
@@ -117,6 +143,7 @@ pub enum Event {
     Name { puuid: String, riot_id: String },
     Rank { puuid: String, rank: Fetch<RankProfile> },
     Stats { puuid: String, stats: Fetch<Stats> },
+    Impact { puuid: String, impact: Fetch<Impact> },
     Icon { key: IconKey, image: egui::ColorImage },
     LookupResolved { query: String, puuid: String },
     LookupFailed { query: String, reason: String },
