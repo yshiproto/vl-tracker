@@ -14,8 +14,8 @@
 use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, RichText, Sense, Vec2, ViewportId};
 
 use crate::config::OverlayConfig;
-use crate::model::{Fetch, IconKey, Impact, RankProfile, RoundSwing, Side, Slot, Status};
-use crate::val_assets::Assets;
+use crate::details::CARD_WIDTH;
+use crate::model::{Fetch, IconKey, RankProfile, Side, Slot, Status};
 use crate::win32::{self, Hotkey};
 use crate::{App, Columns, PlayerInfo, impact_label};
 
@@ -23,8 +23,6 @@ use crate::{App, Columns, PlayerInfo, impact_label};
 const LOADING_BOX: Vec2 = Vec2::new(250.0, 58.0);
 /// Agent-select box: one 126 px card wide, fits the strip under the card row.
 const AGENT_BOX: Vec2 = Vec2::new(126.0, 36.0);
-const CARD_WIDTH: f32 = 340.0;
-const STRIP_HEIGHT: f32 = 34.0;
 const BADGE: f32 = 24.0;
 const INTERACTIVE_TITLE: &str = "vltracker overlay (interactive)";
 const PASSTHROUGH_TITLE: &str = "vltracker overlay";
@@ -317,7 +315,7 @@ impl App {
                 .pivot(pivot)
                 .constrain(true)
                 .order(egui::Order::Foreground)
-                .show(ctx, |ui| panel_frame().show(ui, |ui| self.detail_card(ui, &slot)));
+                .show(ctx, |ui| panel_frame().show(ui, |ui| self.detail_card(ui, &slot.puuid)));
             rects.push(card.response.rect);
         }
         rects
@@ -449,9 +447,10 @@ impl App {
                 None => ui.allocate_exact_size(Vec2::splat(BADGE), Sense::hover()).1,
             };
             ui.vertical(|ui| {
+                // Long names truncate instead of widening the box past the banner.
                 let name = info.and_then(|p| p.riot_id.as_deref()).unwrap_or("…");
-                ui.label(RichText::new(name).strong());
-                ui.label(RichText::new(self.rank_text(&rank)).small());
+                ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
+                ui.add(egui::Label::new(RichText::new(self.rank_text(&rank)).small()).truncate());
             });
         });
         ui.horizontal(|ui| {
@@ -470,69 +469,6 @@ impl App {
             }
             ui.label(RichText::new(stats_line(info)).small());
         });
-    }
-
-    fn detail_card(&mut self, ui: &mut egui::Ui, slot: &Slot) {
-        ui.set_width(CARD_WIDTH);
-        let info = self.players.get(&slot.puuid);
-        let name = info.and_then(|p| p.riot_id.clone()).unwrap_or_else(|| "…".into());
-        ui.label(RichText::new(name).strong().size(16.0));
-        let rank = info.map(|p| p.rank.clone()).unwrap_or_default();
-        ui.label(format!("Rank: {}", self.rank_text(&rank)));
-        if let Fetch::Ready(profile) = &rank
-            && let Some((tier, act)) = self.peak(profile)
-        {
-            ui.label(format!("Peak: {} ({act})", self.tier_label(tier)));
-        }
-
-        ui.add_space(4.0);
-        match info.map(|p| p.impact.clone()).unwrap_or_default() {
-            Fetch::Ready(i) => impact_section(ui, &i, self.assets.as_deref()),
-            Fetch::Pending => {
-                ui.label(RichText::new("Calculating impact from the last 10 matches…").weak());
-            }
-            Fetch::Unavailable(reason) => {
-                ui.label(RichText::new(format!("Impact unavailable: {reason}")).weak());
-            }
-        }
-
-        ui.add_space(4.0);
-        let stats = info.map(|p| p.stats.clone()).unwrap_or_default();
-        match &stats {
-            Fetch::Ready(s) => {
-                ui.label(RichText::new(format!("Last {} competitive", s.matches)).weak());
-                let decided = (s.wins + s.losses).max(1);
-                ui.label(format!(
-                    "Win rate {:.0}%  ({}W {}L)",
-                    s.wins as f32 * 100.0 / decided as f32,
-                    s.wins,
-                    s.losses
-                ));
-                ui.label(format!("ACS {:.0} · ADR {:.0} · K/D {:.2} · HS {:.0}%", s.acs, s.adr, s.kd, s.hs_pct));
-            }
-            Fetch::Pending => {
-                ui.label(RichText::new("Loading match stats…").weak());
-            }
-            Fetch::Unavailable(reason) => {
-                ui.label(RichText::new(format!("Match stats unavailable: {reason}")).weak());
-            }
-        }
-
-        if let Fetch::Ready(profile) = &rank {
-            let acts = self.recent_acts(profile, 4);
-            if !acts.is_empty() {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Recent acts").weak());
-                egui::Grid::new("detail_acts").num_columns(3).spacing([10.0, 2.0]).show(ui, |ui| {
-                    for (label, tier, wins, games) in acts {
-                        ui.label(RichText::new(label).small());
-                        ui.label(RichText::new(self.tier_label(tier)).small());
-                        ui.label(RichText::new(format!("{wins}W / {games}G")).small().weak());
-                        ui.end_row();
-                    }
-                });
-            }
-        }
     }
 
     /// Players on one side in the order Valorant draws them: the server's roster order, with the
@@ -574,215 +510,6 @@ impl App {
         let mut slots: Vec<Slot> = roster.slots.iter().filter(|s| roster.ffa || s.side == side).cloned().collect();
         slots.sort_by_key(|s| !s.is_self);
         slots
-    }
-
-    pub(crate) fn rank_text(&self, rank: &Fetch<RankProfile>) -> String {
-        match rank {
-            Fetch::Pending => "…".into(),
-            Fetch::Unavailable(_) => "Rank unavailable".into(),
-            Fetch::Ready(p) if p.current.tier == 0 => "Unranked".into(),
-            Fetch::Ready(p) => format!("{} · {} RR", self.tier_label(p.current.tier), p.current.rr),
-        }
-    }
-
-    pub(crate) fn tier_label(&self, tier: u32) -> String {
-        self.assets.as_ref().and_then(|a| a.tier_name(tier)).map_or_else(|| format!("Tier {tier}"), str::to_owned)
-    }
-
-    /// Highest tier across all acts (normalized to the current table) and the act it was reached in.
-    fn peak(&self, profile: &RankProfile) -> Option<(u32, String)> {
-        let assets = self.assets.as_ref()?;
-        profile
-            .acts
-            .iter()
-            .map(|a| (assets.normalize_tier(&a.act, a.peak_tier), a))
-            .filter(|(tier, _)| *tier > 0)
-            .max_by_key(|(tier, a)| (*tier, assets.acts.get(&a.act).map(|x| x.start.clone())))
-            .map(|(tier, a)| (tier, act_label(self, &a.act)))
-    }
-
-    /// Newest acts first: (label, final tier normalized, wins, games).
-    fn recent_acts(&self, profile: &RankProfile, n: usize) -> Vec<(String, u32, u32, u32)> {
-        let Some(assets) = &self.assets else { return Vec::new() };
-        let mut acts: Vec<_> = profile.acts.iter().collect();
-        acts.sort_by(|a, b| {
-            let start = |x: &str| assets.acts.get(x).map(|a| a.start.as_str()).unwrap_or("");
-            start(&b.act).cmp(start(&a.act))
-        });
-        acts.into_iter()
-            .take(n)
-            .map(|a| (act_label(self, &a.act), assets.normalize_tier(&a.act, a.tier), a.wins, a.games))
-            .collect()
-    }
-}
-
-fn act_label(app: &App, act: &str) -> String {
-    app.assets.as_ref().and_then(|a| a.acts.get(act)).map_or_else(|| "Unknown act".into(), |a| a.label.clone())
-}
-
-fn impact_section(ui: &mut egui::Ui, i: &Impact, assets: Option<&Assets>) {
-    let (label, color) = impact_label(i.rating);
-    let agent = i.main_agent.as_deref();
-    let role = agent.and_then(|a| assets?.agent_role(a));
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("Impact {:.2}", i.rating)).strong().size(15.0).color(color));
-        ui.label(RichText::new(label).color(color));
-        if let (Some(role), Some(name)) = (role, agent.and_then(|a| assets?.agent_name(a))) {
-            ui.label(RichText::new(format!("· {role} ({name})")).weak());
-        }
-    });
-    ui.label(
-        RichText::new(format!(
-            "{:+.1}% round-win probability per round · {} rounds, last {} competitive",
-            i.wpa_per_round * 100.0,
-            i.rounds,
-            i.matches
-        ))
-        .small()
-        .weak(),
-    );
-    round_strip(ui, &i.recent_rounds);
-
-    ui.label(format!(
-        "Opening duels {}–{} · KAST {:.0}% · Clutches {}/{} · Impact frags {}",
-        i.opening_wins,
-        i.opening_losses,
-        i.kast * 100.0,
-        i.clutches_won,
-        i.clutches,
-        i.impact_frags
-    ))
-    .on_hover_text("Impact frags: kills after the opening duel that swung the round by 25+ points");
-
-    // Role-specific lines; the one that matters most for the role goes first and bold.
-    let traded = i.deaths_traded as f32 * 100.0 / i.deaths.max(1) as f32;
-    let trades = (
-        format!(
-            "Trades {} instant · {} late · deaths traded {traded:.0}% · missed refrags {}",
-            i.trades_fast, i.trades_late, i.missed_refrags
-        ),
-        "Instant: within 2 s of the teammate's death; late: 2–5 s. Missed refrag: a teammate died within \
-         ~15 m of you and their killer survived the next 5 s.",
-    );
-    let util = (
-        format!(
-            "Utility: {} util assists · {} ability kills · {:.1} casts/rd{}",
-            i.util_assists,
-            i.ability_kills,
-            i.casts_per_round,
-            i.agent_casts_per_round.map(|a| format!(" (agent avg {a:.1})")).unwrap_or_default()
-        ),
-        "Util assists: assists on players you never damaged that round (flashes, debuffs). \
-         Casts are match totals; usage alone isn't rated.",
-    );
-    let entry = (i.entry_wins + i.entry_losses > 0).then(|| {
-        let rate = i.entry_wins as f32 * 100.0 / (i.entry_wins + i.entry_losses) as f32;
-        let spot = i.entry_spot.as_deref().map(|s| format!(", mostly {s}")).unwrap_or_default();
-        (
-            format!("Site entries {}W–{}L ({rate:.0}%){spot}", i.entry_wins, i.entry_losses),
-            "The attackers' first fight inside a site area before the plant, won or lost by this player.",
-        )
-    });
-    let lurk = (i.lurk_rounds > 0).then(|| {
-        (
-            format!(
-                "Lurks {} rounds · {:+.1}%/rd swing · {} late kills · {} untraded deaths",
-                i.lurk_rounds,
-                i.lurk_swing * 100.0,
-                i.lurk_late_kills,
-                i.lurk_deaths_untraded
-            ),
-            "Attack rounds where your own fight (or a solo plant) happened ~30 m+ from every teammate before \
-             the plant. Late kills: isolated kills after the round was already decided.",
-        )
-    });
-    let mut lines: Vec<(String, &str)> = [Some(trades), Some(util), entry, lurk].into_iter().flatten().collect();
-    let lead = match role {
-        Some("Duelist") => lines.iter().position(|(l, _)| l.starts_with("Site entries")),
-        Some("Sentinel") => lines.iter().position(|(l, _)| l.starts_with("Lurks")),
-        Some("Initiator" | "Controller") => lines.iter().position(|(l, _)| l.starts_with("Utility")),
-        _ => None,
-    };
-    if let Some(lead) = lead {
-        let (text, hint) = lines.remove(lead);
-        ui.label(RichText::new(text).strong()).on_hover_text(hint);
-    }
-    for (text, hint) in lines {
-        ui.label(text).on_hover_text(hint);
-    }
-
-    if i.kills > 0 {
-        let low = i.low_impact_kills as f32 * 100.0 / i.kills as f32;
-        ui.label(format!("Low-impact kills {low:.0}% of {}", i.kills))
-            .on_hover_text("Kills that moved round-win odds by under 3 points: exit frags, eco kills, …");
-    }
-    if let Some(note) = impact_note(i) {
-        ui.label(RichText::new(note).italics().color(color));
-    }
-}
-
-/// One bar per round (oldest left): up = round-win probability added, down = lost. A tick under
-/// each bar marks rounds the team won; a gap separates matches. Hover for the round.
-fn round_strip(ui: &mut egui::Ui, rounds: &[RoundSwing]) {
-    if rounds.is_empty() {
-        return;
-    }
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(CARD_WIDTH, STRIP_HEIGHT), Sense::hover());
-    let painter = ui.painter_at(rect);
-    let gaps = rounds.iter().filter(|r| r.match_start).count().saturating_sub(1) as f32;
-    let slot = ((rect.width() - gaps * 4.0) / rounds.len() as f32).min(10.0);
-    let mid = rect.center().y - 3.0;
-    let half = STRIP_HEIGHT / 2.0 - 5.0;
-    painter.hline(rect.x_range(), mid, egui::Stroke::new(1.0, Color32::from_white_alpha(30)));
-
-    let mut x = rect.left();
-    let mut hovered = None;
-    let mut round_no = 0;
-    for (idx, r) in rounds.iter().enumerate() {
-        if r.match_start {
-            if idx > 0 {
-                x += 4.0;
-            }
-            round_no = 0;
-        }
-        round_no += 1;
-        let height = (r.swing.abs() / 0.5).min(1.0) * half;
-        let (top, bottom) = if r.swing >= 0.0 { (mid - height, mid) } else { (mid, mid + height) };
-        let color = if r.swing >= 0.0 { Color32::from_rgb(90, 210, 120) } else { Color32::from_rgb(230, 110, 100) };
-        let bar = Rect::from_min_max(Pos2::new(x + 1.0, top), Pos2::new(x + slot - 1.0, bottom.max(top + 1.0)));
-        painter.rect_filled(bar, 1.0, color);
-        let tick = if r.won { Color32::from_white_alpha(140) } else { Color32::from_white_alpha(25) };
-        let tick_rect = Rect::from_min_max(Pos2::new(x + 1.0, rect.bottom() - 3.0), Pos2::new(x + slot - 1.0, rect.bottom()));
-        painter.rect_filled(tick_rect, 0.0, tick);
-        if response.hover_pos().is_some_and(|p| p.x >= x && p.x < x + slot) {
-            hovered = Some((round_no, r));
-        }
-        x += slot;
-    }
-    if let Some((n, r)) = hovered {
-        let mut text = format!("Round {n}: {:+.1}% · {} kill{}", r.swing * 100.0, r.kills, if r.kills == 1 { "" } else { "s" });
-        for (flag, label) in [(r.died, "died"), (r.planted, "planted"), (r.defused, "defused")] {
-            if flag {
-                text.push_str(&format!(" · {label}"));
-            }
-        }
-        text.push_str(if r.won { " · won" } else { " · lost" });
-        response.on_hover_text_at_pointer(text);
-    }
-}
-
-/// Calls out where the scoreboard and the impact disagree.
-fn impact_note(i: &Impact) -> Option<&'static str> {
-    let kd = i.kills as f32 / i.deaths.max(1) as f32;
-    let low_share = i.low_impact_kills as f32 / i.kills.max(1) as f32;
-    if kd >= 1.10 && i.rating < 0.95 {
-        Some("Kills aren't turning into rounds won")
-    } else if kd < 0.95 && i.rating >= 1.07 {
-        Some("Wins rounds beyond what K/D shows")
-    } else if i.kills >= 10 && low_share >= 0.40 {
-        Some("Many kills come after the round is decided or against weaker buys")
-    } else {
-        None
     }
 }
 

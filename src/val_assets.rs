@@ -228,8 +228,10 @@ impl Assets {
             .filter(|s| s.kind.as_deref() == Some("EAresSeasonType::Act"))
             .map(|s| {
                 let parent = s.parent_uuid.as_deref().unwrap_or_default();
+                // Newer acts carry a title ("V26 // ACT IV"); older ones are built from
+                // upper-case names, so "EPISODE 4 ACT III" becomes "Episode 4 Act III".
                 let label = s.title.clone().unwrap_or_else(|| {
-                    format!("{} {}", names.get(parent).copied().unwrap_or_default(), s.display_name)
+                    title_case(&format!("{} {}", names.get(parent).copied().unwrap_or_default(), s.display_name))
                 });
                 // Competitive seasons are keyed by the act or by its parent episode.
                 let table = table_of
@@ -305,19 +307,19 @@ fn map_onto(old: &TierTableDto, current: &TierTableDto) -> HashMap<u32, u32> {
         .collect()
 }
 
-/// "IMMORTAL 3" → "Immortal 3"
+/// "IMMORTAL 3" → "Immortal 3"; roman numerals stay upper-case ("EPISODE 4 ACT III" →
+/// "Episode 4 Act III").
 fn title_case(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut word_start = true;
-    for c in s.chars() {
-        if word_start {
-            out.extend(c.to_uppercase());
-        } else {
-            out.extend(c.to_lowercase());
-        }
-        word_start = c.is_whitespace();
-    }
-    out
+    s.split(' ')
+        .map(|word| {
+            if !word.is_empty() && word.chars().all(|c| matches!(c, 'I' | 'V' | 'X')) {
+                return word.to_owned();
+            }
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars.flat_map(char::to_lowercase)).collect())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn icon_cache_path(url: &str) -> Option<PathBuf> {
@@ -363,4 +365,16 @@ fn decode(png: &[u8]) -> Result<egui::ColorImage> {
     let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)?.into_rgba8();
     let size = [img.width() as usize, img.height() as usize];
     Ok(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::title_case;
+
+    #[test]
+    fn title_case_keeps_roman_numerals() {
+        assert_eq!(title_case("EPISODE 4 ACT III"), "Episode 4 Act III");
+        assert_eq!(title_case("IMMORTAL 3"), "Immortal 3");
+        assert_eq!(title_case("IRON 1"), "Iron 1");
+    }
 }

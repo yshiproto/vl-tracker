@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod details;
 mod henrik_api;
 mod impact;
 mod model;
@@ -32,14 +33,14 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("vltracker")
-            .with_inner_size([1040.0, 440.0])
-            .with_min_inner_size([760.0, 300.0]),
+            .with_inner_size([1100.0, 560.0])
+            .with_min_inner_size([760.0, 360.0]),
         ..Default::default()
     };
     eframe::run_native("vltracker", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PlayerInfo {
     riot_id: Option<String>,
     rank: Fetch<RankProfile>,
@@ -72,6 +73,8 @@ struct App {
     icons_requested: HashSet<IconKey>,
     hotkeys: mpsc::Receiver<Hotkey>,
     overlay: OverlayState,
+    /// Player shown in the main window's details panel.
+    details: Option<String>,
 }
 
 impl App {
@@ -107,6 +110,7 @@ impl App {
             icons_requested: HashSet::new(),
             hotkeys,
             overlay: OverlayState::default(),
+            details: None,
         }
     }
 
@@ -128,6 +132,8 @@ impl App {
             }
             Event::LookupResolved { query, puuid } => {
                 if matches!(&self.lookup, Some(Lookup::Pending(q)) if *q == query) {
+                    // A lookup is a request to inspect that player.
+                    self.details = Some(puuid.clone());
                     self.lookup = Some(Lookup::Resolved(puuid));
                 }
             }
@@ -265,22 +271,34 @@ impl App {
 
         let mut slots = roster.slots.clone();
         slots.sort_by_key(|s| !s.is_self);
-        if roster.ffa {
-            ui.heading("Players");
-            self.player_grid(ui, "ffa_grid", &slots, Columns::Main);
-            return;
-        }
-
-        let (allies, enemies): (Vec<Slot>, Vec<Slot>) = slots.into_iter().partition(|s| s.side == Side::Ally);
+        let ffa = roster.ffa;
         let pregame = self.status == Status::AgentSelect;
-        ui.columns(2, |cols| {
-            cols[0].heading("My Team");
-            self.player_grid(&mut cols[0], "ally_grid", &allies, Columns::Main);
-            cols[1].heading("Enemy Team");
-            if enemies.is_empty() && pregame {
-                cols[1].label(RichText::new("Enemies are revealed once the match loads.").weak());
+        // Two team grids side by side need ~980 pt; with the details panel open they stack instead.
+        let side_by_side = ui.available_width() >= 980.0;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            if ffa {
+                ui.heading("Players");
+                self.player_grid(ui, "ffa_grid", &slots, Columns::Main);
+                return;
+            }
+            let (allies, enemies): (Vec<Slot>, Vec<Slot>) = slots.into_iter().partition(|s| s.side == Side::Ally);
+            let team = |app: &mut Self, ui: &mut egui::Ui, title: &str, id: &str, slots: &[Slot]| {
+                ui.heading(title);
+                if slots.is_empty() && pregame {
+                    ui.label(RichText::new("Enemies are revealed once the match loads.").weak());
+                } else {
+                    app.player_grid(ui, id, slots, Columns::Main);
+                }
+            };
+            if side_by_side {
+                ui.columns(2, |cols| {
+                    team(self, &mut cols[0], "My Team", "ally_grid", &allies);
+                    team(self, &mut cols[1], "Enemy Team", "enemy_grid", &enemies);
+                });
             } else {
-                self.player_grid(&mut cols[1], "enemy_grid", &enemies, Columns::Main);
+                team(self, ui, "My Team", "ally_grid", &allies);
+                ui.add_space(10.0);
+                team(self, ui, "Enemy Team", "enemy_grid", &enemies);
             }
         });
     }
@@ -349,8 +367,25 @@ impl App {
 
         let info = self.players.get(&slot.puuid);
         let name = info.and_then(|p| p.riot_id.as_deref()).unwrap_or("…");
-        let name = if slot.is_self { RichText::new(name).strong().color(Color32::from_rgb(240, 200, 80)) } else { RichText::new(name) };
-        ui.label(name);
+        let selected = self.details.as_deref() == Some(slot.puuid.as_str());
+        let mut text = RichText::new(name);
+        if slot.is_self {
+            text = text.strong().color(Color32::from_rgb(240, 200, 80));
+        }
+        // Names in the main window open the details panel; the overlay scoreboard has no cursor.
+        let mut toggle_details = false;
+        if columns == Columns::Main {
+            if selected {
+                text = text.underline();
+            }
+            toggle_details = ui
+                .add(egui::Label::new(text).sense(egui::Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Show details")
+                .clicked();
+        } else {
+            ui.label(text);
+        }
 
         fetch_cell(ui, &rank, |_| self.rank_text(&rank));
         if columns == Columns::Main {
@@ -377,6 +412,10 @@ impl App {
             for cell in cells {
                 cell.on_hover_text(&h);
             }
+        }
+        if toggle_details {
+            let selected = self.details.as_deref() == Some(slot.puuid.as_str());
+            self.details = (!selected).then(|| slot.puuid.clone());
         }
     }
 }
@@ -459,6 +498,22 @@ impl eframe::App for App {
                 ui.add_space(4.0);
                 self.lookup_panel(ui);
                 ui.add_space(4.0);
+            });
+        }
+        if let Some(puuid) = self.details.clone() {
+            egui::Panel::right("details").resizable(false).exact_size(details::CARD_WIDTH + 30.0).show(ui, |ui| {
+                ui.add_space(4.0);
+                let mut close = false;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Player details").strong());
+                    if ui.small_button("×").on_hover_text("Close").clicked() {
+                        close = true;
+                    }
+                });
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.detail_card(ui, &puuid));
+                if close {
+                    self.details = None;
+                }
             });
         }
         egui::CentralPanel::default().show(ui, |ui| self.match_view(ui));
