@@ -17,7 +17,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
-use crate::henrik_api::{Account, Henrik};
+use crate::henrik_api::{Account, Henrik, IMPACT_PAGE};
+use crate::impact::{self, WinModel};
 use crate::model::{Command, Error, Event, Fetch, IconKey, Result, Roster, Status, UiSink};
 use crate::riot_local::{LogTail, Lockfile, LoopState, RiotSession};
 use crate::val_assets::{self, Assets};
@@ -80,6 +81,8 @@ struct Worker {
     /// Everything remote, with normal certificate verification.
     remote: reqwest::Client,
     henrik: Arc<Henrik>,
+    /// Shared by player jobs; learns from every match fetched and persists to disk.
+    win_model: Arc<std::sync::Mutex<WinModel>>,
     assets: Option<Arc<Assets>>,
     assets_retry_at: Instant,
     icons_waiting: Vec<IconKey>,
@@ -112,6 +115,7 @@ impl Worker {
         Ok(Self {
             ui,
             henrik: Arc::new(Henrik::new(remote.clone(), api_key)),
+            win_model: Arc::new(std::sync::Mutex::new(WinModel::load())),
             local,
             remote,
             assets: None,
@@ -362,6 +366,8 @@ impl Worker {
         let job = PlayerJob {
             session: self.session.clone(),
             henrik: self.henrik.clone(),
+            win_model: self.win_model.clone(),
+            assets: self.assets.clone(),
             ui: self.ui.clone(),
             puuid: puuid.to_owned(),
             region: region.to_owned(),
@@ -447,6 +453,9 @@ impl Worker {
 struct PlayerJob {
     session: Option<Arc<RiotSession>>,
     henrik: Arc<Henrik>,
+    win_model: Arc<std::sync::Mutex<WinModel>>,
+    /// Map callouts for site-entry detection; entries are skipped until assets load.
+    assets: Option<Arc<Assets>>,
     ui: UiSink,
     puuid: String,
     region: String,
@@ -479,6 +488,43 @@ impl PlayerJob {
         let stats = self.henrik.stats(&self.region, &self.puuid).await;
         transient |= stats.as_ref().is_err_and(Error::is_transient);
         self.ui.send(Event::Stats { puuid: self.puuid.clone(), stats: Fetch::from(stats) });
+
+        // Two pages of 5: a first rating as soon as the newest five arrive, refined by the next five.
+        // Teammates are scheduled during agent select and enemies once the match loads, so this
+        // naturally fetches teammates first.
+        let mut matches = Vec::new();
+        for start in [0, IMPACT_PAGE] {
+            let page = match self.henrik.recent_matches(&self.region, &self.puuid, start).await {
+                Ok(page) => page,
+                // Keep the first page's rating if the second page fails.
+                Err(e) if matches.is_empty() => {
+                    transient |= e.is_transient();
+                    self.ui.send(Event::Impact { puuid: self.puuid.clone(), impact: Fetch::from(Err(e)) });
+                    break;
+                }
+                Err(_) => break,
+            };
+            let last = start == IMPACT_PAGE || page.len() < IMPACT_PAGE as usize;
+            matches.extend(page);
+            let impact = {
+                let mut model = self.win_model.lock().unwrap_or_else(|e| e.into_inner());
+                model.ingest(&matches);
+                let impact = impact::evaluate(&matches, &self.puuid, &model, self.assets.as_deref());
+                if last && let Some(i) = &impact {
+                    model.record_spread(i.wpa_per_round as f64);
+                }
+                // Persistence is best effort: a failed write only loses what this session learned.
+                let _ = model.save();
+                impact
+            };
+            self.ui.send(Event::Impact {
+                puuid: self.puuid.clone(),
+                impact: Fetch::from(impact.ok_or(Error::NotFound)),
+            });
+            if last {
+                break;
+            }
+        }
 
         TaskDone::Player { puuid: self.puuid, ok: !transient }
     }

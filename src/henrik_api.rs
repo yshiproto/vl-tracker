@@ -12,11 +12,16 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+use crate::impact::MatchDto;
 use crate::model::{ActRank, Error, Rank, RankProfile, Result, Stats};
 
 const BASE: &str = "https://api.henrikdev.xyz/valorant/";
 /// Matches used for the per-player stat summary.
 const STATS_MATCHES: u32 = 20;
+/// Full matches per page for the impact rating (two pages = last 10).
+pub const IMPACT_PAGE: u32 = 5;
+/// Full-match requests can make HenrikDev fetch several matches from Riot first.
+const SLOW_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_IN_FLIGHT: usize = 3;
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -143,17 +148,17 @@ impl Henrik {
     }
 
     pub async fn account(&self, name: &str, tag: &str) -> Result<Account> {
-        let dto: AccountDto = self.get(&["v2", "account", name, tag], &[]).await?;
+        let dto: AccountDto = self.get(&["v2", "account", name, tag], &[], None).await?;
         Ok(Account { puuid: dto.puuid, riot_id: format!("{}#{}", dto.name, dto.tag), region: dto.region })
     }
 
     pub async fn account_by_puuid(&self, puuid: &str) -> Result<Account> {
-        let dto: AccountDto = self.get(&["v2", "by-puuid", "account", puuid], &[]).await?;
+        let dto: AccountDto = self.get(&["v2", "by-puuid", "account", puuid], &[], None).await?;
         Ok(Account { puuid: dto.puuid, riot_id: format!("{}#{}", dto.name, dto.tag), region: dto.region })
     }
 
     pub async fn rank(&self, region: &str, puuid: &str) -> Result<RankProfile> {
-        let dto: MmrDto = self.get(&["v3", "by-puuid", "mmr", region, "pc", puuid], &[]).await?;
+        let dto: MmrDto = self.get(&["v3", "by-puuid", "mmr", region, "pc", puuid], &[], None).await?;
         let acts = dto
             .seasonal
             .into_iter()
@@ -176,12 +181,30 @@ impl Henrik {
             .get(
                 &["v1", "by-puuid", "stored-matches", region, puuid],
                 &[("mode", "competitive"), ("size", &size)],
+                None,
             )
             .await?;
         aggregate(&matches).ok_or(Error::NotFound)
     }
 
-    async fn get<T: DeserializeOwned>(&self, segments: &[&str], query: &[(&str, &str)]) -> Result<T> {
+    /// One page of full competitive match timelines, newest first, starting `start` matches back
+    /// (costs 1 plus 1 per match HenrikDev has not stored yet).
+    pub async fn recent_matches(&self, region: &str, puuid: &str, start: u32) -> Result<Vec<MatchDto>> {
+        let (size, start) = (IMPACT_PAGE.to_string(), start.to_string());
+        self.get(
+            &["v4", "by-puuid", "matches", region, "pc", puuid],
+            &[("mode", "competitive"), ("size", &size), ("start", &start)],
+            Some(SLOW_TIMEOUT),
+        )
+        .await
+    }
+
+    async fn get<T: DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        timeout: Option<Duration>,
+    ) -> Result<T> {
         let key = self.key.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if key.is_empty() {
             return Err(Error::NoApiKey);
@@ -194,7 +217,11 @@ impl Henrik {
 
         for _ in 0..MAX_ATTEMPTS {
             let _permit = self.acquire().await;
-            let resp = self.http.get(url.clone()).header("Authorization", &key).send().await?;
+            let mut req = self.http.get(url.clone()).header("Authorization", &key);
+            if let Some(t) = timeout {
+                req = req.timeout(t);
+            }
+            let resp = req.send().await?;
             self.observe(&resp);
             match resp.status() {
                 s if s.is_success() => return Ok(resp.json::<Envelope<T>>().await?.data),
