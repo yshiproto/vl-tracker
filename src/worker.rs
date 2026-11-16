@@ -17,19 +17,28 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
-use crate::henrik_api::{Account, Henrik};
+use crate::henrik_api::{Account, Henrik, IMPACT_PAGE};
+use crate::impact::{self, WinModel};
 use crate::model::{Command, Error, Event, Fetch, IconKey, Result, Roster, Status, UiSink};
-use crate::riot_local::{Lockfile, LoopState, RiotSession};
+use crate::riot_local::{LogTail, Lockfile, LoopState, RiotSession};
 use crate::val_assets::{self, Assets};
 
 const IDLE_POLL: Duration = Duration::from_secs(5);
 const MENU_POLL: Duration = Duration::from_secs(4);
 const MATCH_POLL: Duration = Duration::from_secs(15);
+/// Log check cadence while the loading screen is up.
+const LOADING_POLL: Duration = Duration::from_secs(1);
+/// Falls back to "live" if no round-start marker shows up (e.g. the log format changed).
+const LOADING_MAX: Duration = Duration::from_secs(120);
 const ASSET_RETRY: Duration = Duration::from_secs(60);
 /// Rank/stats are not re-requested for a player seen within this window.
 const PLAYER_TTL: Duration = Duration::from_secs(30 * 60);
 
-pub fn spawn(ctx: egui::Context, api_key: String) -> (mpsc::Receiver<Event>, UnboundedSender<Command>) {
+pub fn spawn(
+    ctx: egui::Context,
+    api_key: String,
+    round_start_markers: Vec<String>,
+) -> (mpsc::Receiver<Event>, UnboundedSender<Command>) {
     let (event_tx, event_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let ui = UiSink::new(event_tx, ctx);
@@ -40,7 +49,7 @@ pub fn spawn(ctx: egui::Context, api_key: String) -> (mpsc::Receiver<Event>, Unb
                 Ok(rt) => rt,
                 Err(e) => return ui.send(Event::Notice(Some(format!("Failed to start runtime: {e}")))),
             };
-            match Worker::new(ui.clone(), api_key) {
+            match Worker::new(ui.clone(), api_key, round_start_markers) {
                 Ok(worker) => rt.block_on(worker.run(cmd_rx)),
                 Err(e) => ui.send(Event::Notice(Some(format!("Failed to start HTTP client: {e}")))),
             }
@@ -72,6 +81,8 @@ struct Worker {
     /// Everything remote, with normal certificate verification.
     remote: reqwest::Client,
     henrik: Arc<Henrik>,
+    /// Shared by player jobs; learns from every match fetched and persists to disk.
+    win_model: Arc<std::sync::Mutex<WinModel>>,
     assets: Option<Arc<Assets>>,
     assets_retry_at: Instant,
     icons_waiting: Vec<IconKey>,
@@ -84,10 +95,15 @@ struct Worker {
     named: HashSet<String>,
     fetched: HashMap<String, Instant>,
     tasks: JoinSet<TaskDone>,
+    round_start_markers: Vec<String>,
+    /// Armed during agent select at the log's end, so the loading screen's lines can be followed.
+    log_tail: Option<LogTail>,
+    /// Set while the loading screen is up.
+    loading: Option<(LogTail, Instant)>,
 }
 
 impl Worker {
-    fn new(ui: UiSink, api_key: String) -> reqwest::Result<Self> {
+    fn new(ui: UiSink, api_key: String, round_start_markers: Vec<String>) -> reqwest::Result<Self> {
         let local = reqwest::Client::builder()
             .tls_danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(5))
@@ -99,6 +115,7 @@ impl Worker {
         Ok(Self {
             ui,
             henrik: Arc::new(Henrik::new(remote.clone(), api_key)),
+            win_model: Arc::new(std::sync::Mutex::new(WinModel::load())),
             local,
             remote,
             assets: None,
@@ -113,6 +130,9 @@ impl Worker {
             named: HashSet::new(),
             fetched: HashMap::new(),
             tasks: JoinSet::new(),
+            round_start_markers,
+            log_tail: None,
+            loading: None,
         })
     }
 
@@ -201,6 +221,7 @@ impl Worker {
             LoopState::Menus => {
                 self.set_status(Status::InMenu);
                 self.set_roster(None, false);
+                self.log_tail = None;
                 Ok(MENU_POLL)
             }
             LoopState::Pregame => match self.poll_pregame(&session).await {
@@ -211,14 +232,15 @@ impl Worker {
                 }
                 r => r.map(|_| MENU_POLL),
             },
-            // Roster loaded: presence leaving INGAME is what ends the match, no remote calls.
-            LoopState::InGame if self.roster_is_core && self.roster.is_some() => Ok(MATCH_POLL),
+            // Roster loaded: presence leaving INGAME is what ends the match, no remote calls
+            // beyond following the log while the loading screen is up.
+            LoopState::InGame if self.roster_is_core && self.roster.is_some() => Ok(self.poll_loading()),
             LoopState::InGame => match self.poll_core(&session).await {
                 Ok(false) => {
                     self.set_roster(None, false);
                     Ok(MENU_POLL)
                 }
-                r => r.map(|_| MATCH_POLL),
+                r => r.map(|_| self.poll_loading()),
             },
             LoopState::Unknown => self.poll_unknown(&session).await,
         };
@@ -264,6 +286,7 @@ impl Worker {
         let roster = session.pregame_roster(&id).await?;
         self.set_status(Status::AgentSelect);
         self.apply_roster(session, roster, false).await;
+        self.log_tail = LogTail::game_log_at_end();
         Ok(true)
     }
 
@@ -274,15 +297,28 @@ impl Worker {
         if !known {
             let roster = session.core_roster(&id).await?;
             self.apply_roster(session, roster, true).await;
+            // Only a match entered from agent select has a loading screen we watched start.
+            self.loading = self.log_tail.take().map(|tail| (tail, Instant::now()));
         }
-        self.set_status(Status::LiveMatch);
+        self.set_status(if self.loading.is_some() { Status::Loading } else { Status::LiveMatch });
         Ok(true)
+    }
+
+    /// Ends the loading phase on the first round-start log line (or after `LOADING_MAX`).
+    fn poll_loading(&mut self) -> Duration {
+        let Some((tail, since)) = &mut self.loading else { return MATCH_POLL };
+        if !tail.saw_any(&self.round_start_markers) && since.elapsed() < LOADING_MAX {
+            return LOADING_POLL;
+        }
+        self.loading = None;
+        self.set_status(Status::LiveMatch);
+        MATCH_POLL
     }
 
     /// Presence was unreadable: ask GLZ directly, the way the original plan polled.
     async fn poll_unknown(&mut self, session: &RiotSession) -> Result<Duration> {
         if self.poll_core(session).await? {
-            return Ok(MATCH_POLL);
+            return Ok(self.poll_loading());
         }
         if self.poll_pregame(session).await? {
             return Ok(MENU_POLL);
@@ -330,6 +366,8 @@ impl Worker {
         let job = PlayerJob {
             session: self.session.clone(),
             henrik: self.henrik.clone(),
+            win_model: self.win_model.clone(),
+            assets: self.assets.clone(),
             ui: self.ui.clone(),
             puuid: puuid.to_owned(),
             region: region.to_owned(),
@@ -390,6 +428,9 @@ impl Worker {
 
     fn set_roster(&mut self, roster: Option<Roster>, is_core: bool) {
         self.roster_is_core = is_core;
+        if roster.is_none() {
+            self.loading = None;
+        }
         if self.roster != roster {
             self.roster = roster.clone();
             self.ui.send(Event::Roster(roster));
@@ -412,6 +453,9 @@ impl Worker {
 struct PlayerJob {
     session: Option<Arc<RiotSession>>,
     henrik: Arc<Henrik>,
+    win_model: Arc<std::sync::Mutex<WinModel>>,
+    /// Map callouts for site-entry detection; entries are skipped until assets load.
+    assets: Option<Arc<Assets>>,
     ui: UiSink,
     puuid: String,
     region: String,
@@ -444,6 +488,43 @@ impl PlayerJob {
         let stats = self.henrik.stats(&self.region, &self.puuid).await;
         transient |= stats.as_ref().is_err_and(Error::is_transient);
         self.ui.send(Event::Stats { puuid: self.puuid.clone(), stats: Fetch::from(stats) });
+
+        // Two pages of 5: a first rating as soon as the newest five arrive, refined by the next five.
+        // Teammates are scheduled during agent select and enemies once the match loads, so this
+        // naturally fetches teammates first.
+        let mut matches = Vec::new();
+        for start in [0, IMPACT_PAGE] {
+            let page = match self.henrik.recent_matches(&self.region, &self.puuid, start).await {
+                Ok(page) => page,
+                // Keep the first page's rating if the second page fails.
+                Err(e) if matches.is_empty() => {
+                    transient |= e.is_transient();
+                    self.ui.send(Event::Impact { puuid: self.puuid.clone(), impact: Fetch::from(Err(e)) });
+                    break;
+                }
+                Err(_) => break,
+            };
+            let last = start == IMPACT_PAGE || page.len() < IMPACT_PAGE as usize;
+            matches.extend(page);
+            let impact = {
+                let mut model = self.win_model.lock().unwrap_or_else(|e| e.into_inner());
+                model.ingest(&matches);
+                let impact = impact::evaluate(&matches, &self.puuid, &model, self.assets.as_deref());
+                if last && let Some(i) = &impact {
+                    model.record_spread(i.wpa_per_round as f64);
+                }
+                // Persistence is best effort: a failed write only loses what this session learned.
+                let _ = model.save();
+                impact
+            };
+            self.ui.send(Event::Impact {
+                puuid: self.puuid.clone(),
+                impact: Fetch::from(impact.ok_or(Error::NotFound)),
+            });
+            if last {
+                break;
+            }
+        }
 
         TaskDone::Player { puuid: self.puuid, ok: !transient }
     }
