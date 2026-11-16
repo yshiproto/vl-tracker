@@ -16,6 +16,8 @@ use crate::model::{Error, IconKey, Result};
 
 const AGENTS_URL: &str = "https://valorant-api.com/v1/agents?isPlayableCharacter=true";
 const TIERS_URL: &str = "https://valorant-api.com/v1/competitivetiers";
+const SEASONS_URL: &str = "https://valorant-api.com/v1/seasons";
+const COMP_SEASONS_URL: &str = "https://valorant-api.com/v1/seasons/competitive";
 const VERSION_URL: &str = "https://valorant-api.com/v1/version";
 
 /// Square edge of cached icons: 32 logical px at 2x DPI scaling.
@@ -31,11 +33,24 @@ pub struct Tier {
     pub icon: Option<String>,
 }
 
+pub struct Act {
+    /// e.g. "V26 // ACT IV".
+    pub label: String,
+    /// RFC 3339; sorts chronologically as a string.
+    pub start: String,
+    /// Tier table this act was ranked on; `None` means the current table.
+    table: Option<String>,
+}
+
 pub struct Assets {
     /// Keyed by lowercase agent UUID.
     pub agents: HashMap<String, Agent>,
     /// Keyed by tier index from the current episode's tier table.
     pub tiers: HashMap<u32, Tier>,
+    /// Keyed by lowercase act UUID (PD `SeasonID`, HenrikDev `season.id`).
+    pub acts: HashMap<String, Act>,
+    /// Older tier tables mapped onto current tier numbers, keyed by table UUID.
+    tier_maps: HashMap<String, HashMap<u32, u32>>,
     /// `riotClientVersion`, used if the local game log has no version line.
     pub client_version: Option<String>,
 }
@@ -55,7 +70,27 @@ struct AgentDto {
 
 #[derive(Deserialize)]
 struct TierTableDto {
+    uuid: String,
     tiers: Vec<TierDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SeasonDto {
+    uuid: String,
+    display_name: String,
+    title: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    parent_uuid: Option<String>,
+    start_time: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompSeasonDto {
+    season_uuid: String,
+    competitive_tiers_uuid: String,
 }
 
 #[derive(Deserialize)]
@@ -79,9 +114,11 @@ async fn get_data<T: DeserializeOwned>(http: &reqwest::Client, url: &str) -> Res
 
 impl Assets {
     pub async fn fetch(http: &reqwest::Client) -> Result<Self> {
-        let (agents, tables, version) = tokio::join!(
+        let (agents, tables, seasons, comp, version) = tokio::join!(
             get_data::<Vec<AgentDto>>(http, AGENTS_URL),
             get_data::<Vec<TierTableDto>>(http, TIERS_URL),
+            get_data::<Vec<SeasonDto>>(http, SEASONS_URL),
+            get_data::<Vec<CompSeasonDto>>(http, COMP_SEASONS_URL),
             get_data::<VersionDto>(http, VERSION_URL),
         );
 
@@ -94,15 +131,53 @@ impl Assets {
             .collect();
 
         // Tables are ordered by episode; the last one is current.
-        let tiers = tables?
-            .pop()
-            .ok_or(Error::Missing("competitive tier table"))?
+        let mut tables = tables?;
+        let current = tables.pop().ok_or(Error::Missing("competitive tier table"))?;
+        let tier_maps = tables.iter().map(|t| (t.uuid.to_ascii_lowercase(), map_onto(t, &current))).collect();
+        let tiers = current
             .tiers
             .into_iter()
             .map(|t| (t.tier, Tier { name: title_case(&t.tier_name), icon: t.small_icon }))
             .collect();
 
-        Ok(Self { agents, tiers, client_version: version.ok().map(|v| v.riot_client_version) })
+        // Act metadata is optional: without it, act history shows raw labels.
+        let table_of: HashMap<String, String> = comp
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.season_uuid.to_ascii_lowercase(), c.competitive_tiers_uuid.to_ascii_lowercase()))
+            .collect();
+        let seasons = seasons.unwrap_or_default();
+        let names: HashMap<&str, &str> = seasons.iter().map(|s| (s.uuid.as_str(), s.display_name.as_str())).collect();
+        let acts = seasons
+            .iter()
+            .filter(|s| s.kind.as_deref() == Some("EAresSeasonType::Act"))
+            .map(|s| {
+                let parent = s.parent_uuid.as_deref().unwrap_or_default();
+                let label = s.title.clone().unwrap_or_else(|| {
+                    format!("{} {}", names.get(parent).copied().unwrap_or_default(), s.display_name)
+                });
+                // Competitive seasons are keyed by the act or by its parent episode.
+                let table = table_of
+                    .get(&s.uuid.to_ascii_lowercase())
+                    .or_else(|| table_of.get(&parent.to_ascii_lowercase()))
+                    .filter(|t| **t != current.uuid.to_ascii_lowercase())
+                    .cloned();
+                let act = Act { label, start: s.start_time.clone().unwrap_or_default(), table };
+                (s.uuid.to_ascii_lowercase(), act)
+            })
+            .collect();
+
+        Ok(Self { agents, tiers, acts, tier_maps, client_version: version.ok().map(|v| v.riot_client_version) })
+    }
+
+    /// Converts a tier number recorded during `act` to the current table's numbering.
+    pub fn normalize_tier(&self, act: &str, tier: u32) -> u32 {
+        self.acts
+            .get(act)
+            .and_then(|a| a.table.as_ref())
+            .and_then(|t| self.tier_maps.get(t))
+            .and_then(|m| m.get(&tier).copied())
+            .unwrap_or(tier)
     }
 
     pub fn icon_url(&self, key: &IconKey) -> Option<&str> {
@@ -119,6 +194,21 @@ impl Assets {
     pub fn tier_name(&self, tier: u32) -> Option<&str> {
         self.tiers.get(&tier).map(|t| t.name.as_str())
     }
+}
+
+/// Maps an old table's tiers onto the current one by name. Episode 2's single "IMMORTAL" falls back
+/// to the first current tier sharing its first word ("IMMORTAL 1").
+fn map_onto(old: &TierTableDto, current: &TierTableDto) -> HashMap<u32, u32> {
+    old.tiers
+        .iter()
+        .filter_map(|o| {
+            let first_word = o.tier_name.split_whitespace().next()?;
+            let hit = current.tiers.iter().find(|c| c.tier_name == o.tier_name).or_else(|| {
+                current.tiers.iter().find(|c| c.tier_name.split_whitespace().next() == Some(first_word))
+            })?;
+            Some((o.tier, hit.tier))
+        })
+        .collect()
 }
 
 /// "IMMORTAL 3" → "Immortal 3"

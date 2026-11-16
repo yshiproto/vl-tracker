@@ -14,6 +14,8 @@ pub enum Status {
     WaitingForClient,
     InMenu,
     AgentSelect,
+    /// Match loaded, loading screen still up (no round started yet).
+    Loading,
     LiveMatch,
 }
 
@@ -51,11 +53,36 @@ pub struct Rank {
     pub rr: u32,
 }
 
+/// Final and peak rank in one act. Tiers are in that act's own table numbering;
+/// convert with `Assets::normalize_tier` before comparing or displaying.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ActRank {
+    /// Lowercase act UUID.
+    pub act: String,
+    pub tier: u32,
+    /// Highest tier a win was recorded at during the act.
+    pub peak_tier: u32,
+    pub wins: u32,
+    pub games: u32,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RankProfile {
+    pub current: Rank,
+    pub acts: Vec<ActRank>,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Stats {
     pub kd: f32,
     pub hs_pct: f32,
     pub matches: u32,
+    pub wins: u32,
+    pub losses: u32,
+    /// Average combat score per round.
+    pub acs: f32,
+    /// Average damage per round.
+    pub adr: f32,
 }
 
 /// Per-field load state so each cell renders independently.
@@ -88,7 +115,7 @@ pub enum Event {
     Assets(Arc<Assets>),
     Roster(Option<Roster>),
     Name { puuid: String, riot_id: String },
-    Rank { puuid: String, rank: Fetch<Rank> },
+    Rank { puuid: String, rank: Fetch<RankProfile> },
     Stats { puuid: String, stats: Fetch<Stats> },
     Icon { key: IconKey, image: egui::ColorImage },
     LookupResolved { query: String, puuid: String },

@@ -12,10 +12,10 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-use crate::model::{Error, Rank, Result, Stats};
+use crate::model::{ActRank, Error, Rank, RankProfile, Result, Stats};
 
 const BASE: &str = "https://api.henrikdev.xyz/valorant/";
-/// Matches used for K/D and HS%.
+/// Matches used for the per-player stat summary.
 const STATS_MATCHES: u32 = 20;
 const MAX_IN_FLIGHT: usize = 3;
 const MAX_ATTEMPTS: u32 = 3;
@@ -42,6 +42,8 @@ struct AccountDto {
 #[derive(Deserialize)]
 struct MmrDto {
     current: CurrentMmrDto,
+    #[serde(default)]
+    seasonal: Vec<SeasonalDto>,
 }
 
 #[derive(Deserialize)]
@@ -57,16 +59,39 @@ struct TierDto {
 }
 
 #[derive(Deserialize)]
+struct SeasonalDto {
+    season: SeasonRefDto,
+    end_tier: TierDto,
+    #[serde(default)]
+    games: u32,
+    #[serde(default)]
+    wins: u32,
+    /// One entry per win, at the tier it was won.
+    #[serde(default)]
+    act_wins: Vec<TierDto>,
+}
+
+#[derive(Deserialize)]
+struct SeasonRefDto {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct StoredMatchDto {
     stats: StoredStatsDto,
+    #[serde(default)]
+    teams: RoundsDto,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct StoredStatsDto {
+    team: String,
+    score: u32,
     kills: u32,
     deaths: u32,
     shots: ShotsDto,
+    damage: DamageDto,
 }
 
 #[derive(Deserialize, Default)]
@@ -75,6 +100,20 @@ struct ShotsDto {
     head: u32,
     body: u32,
     leg: u32,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DamageDto {
+    made: u32,
+}
+
+/// Rounds won per team.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RoundsDto {
+    red: u32,
+    blue: u32,
 }
 
 struct Budget {
@@ -113,12 +152,24 @@ impl Henrik {
         Ok(Account { puuid: dto.puuid, riot_id: format!("{}#{}", dto.name, dto.tag), region: dto.region })
     }
 
-    pub async fn rank(&self, region: &str, puuid: &str) -> Result<Rank> {
+    pub async fn rank(&self, region: &str, puuid: &str) -> Result<RankProfile> {
         let dto: MmrDto = self.get(&["v3", "by-puuid", "mmr", region, "pc", puuid], &[]).await?;
-        Ok(Rank { tier: dto.current.tier.id, rr: dto.current.rr })
+        let acts = dto
+            .seasonal
+            .into_iter()
+            .filter(|s| s.games > 0)
+            .map(|s| ActRank {
+                act: s.season.id.to_ascii_lowercase(),
+                peak_tier: s.act_wins.iter().map(|t| t.id).max().unwrap_or(0).max(s.end_tier.id),
+                tier: s.end_tier.id,
+                wins: s.wins,
+                games: s.games,
+            })
+            .collect();
+        Ok(RankProfile { current: Rank { tier: dto.current.tier.id, rr: dto.current.rr }, acts })
     }
 
-    /// K/D and headshot % over the last `STATS_MATCHES` competitive games.
+    /// Summary over the last `STATS_MATCHES` competitive games.
     pub async fn stats(&self, region: &str, puuid: &str) -> Result<Stats> {
         let size = STATS_MATCHES.to_string();
         let matches: Vec<StoredMatchDto> = self
@@ -127,22 +178,7 @@ impl Henrik {
                 &[("mode", "competitive"), ("size", &size)],
             )
             .await?;
-        if matches.is_empty() {
-            return Err(Error::NotFound);
-        }
-        let (mut kills, mut deaths, mut head, mut shots) = (0u32, 0u32, 0u32, 0u32);
-        for m in &matches {
-            let s = &m.stats;
-            kills += s.kills;
-            deaths += s.deaths;
-            head += s.shots.head;
-            shots += s.shots.head + s.shots.body + s.shots.leg;
-        }
-        Ok(Stats {
-            kd: kills as f32 / deaths.max(1) as f32,
-            hs_pct: if shots == 0 { 0.0 } else { head as f32 * 100.0 / shots as f32 },
-            matches: matches.len() as u32,
-        })
+        aggregate(&matches).ok_or(Error::NotFound)
     }
 
     async fn get<T: DeserializeOwned>(&self, segments: &[&str], query: &[(&str, &str)]) -> Result<T> {
@@ -215,5 +251,67 @@ impl Henrik {
         if let Some(reset) = header("x-ratelimit-reset") {
             b.reset_at = Instant::now() + Duration::from_secs(reset);
         }
+    }
+}
+
+fn aggregate(matches: &[StoredMatchDto]) -> Option<Stats> {
+    if matches.is_empty() {
+        return None;
+    }
+    let (mut kills, mut deaths, mut head, mut shots) = (0u32, 0u32, 0u32, 0u32);
+    let (mut score, mut damage, mut rounds, mut wins, mut losses) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    for m in matches {
+        let s = &m.stats;
+        kills += s.kills;
+        deaths += s.deaths;
+        head += s.shots.head;
+        shots += s.shots.head + s.shots.body + s.shots.leg;
+        score += s.score;
+        damage += s.damage.made;
+        rounds += m.teams.red + m.teams.blue;
+        let (mine, theirs) = if s.team.eq_ignore_ascii_case("red") {
+            (m.teams.red, m.teams.blue)
+        } else {
+            (m.teams.blue, m.teams.red)
+        };
+        match mine.cmp(&theirs) {
+            std::cmp::Ordering::Greater => wins += 1,
+            std::cmp::Ordering::Less => losses += 1,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    let per_round = |total: u32| if rounds == 0 { 0.0 } else { total as f32 / rounds as f32 };
+    Some(Stats {
+        kd: kills as f32 / deaths.max(1) as f32,
+        hs_pct: if shots == 0 { 0.0 } else { head as f32 * 100.0 / shots as f32 },
+        matches: matches.len() as u32,
+        wins,
+        losses,
+        acs: per_round(score),
+        adr: per_round(damage),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregates_win_rate_and_per_round_stats_from_stored_matches() {
+        let json = r#"[
+          {"stats":{"team":"Red","score":4000,"kills":20,"deaths":10,"shots":{"head":10,"body":30,"leg":0},
+                    "damage":{"made":3000}},"teams":{"red":13,"blue":7}},
+          {"stats":{"team":"Blue","score":2000,"kills":10,"deaths":20,"shots":{"head":0,"body":10,"leg":0},
+                    "damage":{"made":1000}},"teams":{"red":13,"blue":7}},
+          {"stats":{"team":"Blue","score":2000,"kills":0,"deaths":0},"teams":{"red":12,"blue":12}}
+        ]"#;
+        let matches: Vec<StoredMatchDto> = serde_json::from_str(json).unwrap();
+        let s = aggregate(&matches).unwrap();
+        assert_eq!((s.wins, s.losses, s.matches), (1, 1, 3)); // draw counts as neither
+        assert_eq!(s.kd, 1.0);
+        assert_eq!(s.hs_pct, 20.0);
+        assert_eq!(s.acs, 8000.0 / 64.0);
+        assert_eq!(s.adr, 4000.0 / 64.0);
+        assert!(aggregate(&[]).is_none());
     }
 }

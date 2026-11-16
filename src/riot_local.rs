@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::OnceCell;
 
-use crate::model::{Error, Rank, Result, Roster, Side, Slot};
+use crate::model::{ActRank, Error, Rank, RankProfile, Result, Roster, Side, Slot};
 
 /// Base64 JSON platform descriptor every Riot client sends (PC / Windows 10).
 const CLIENT_PLATFORM: &str = "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9";
@@ -186,6 +186,13 @@ struct SeasonalInfoDto {
     tier: u32,
     #[serde(rename = "RankedRating", default)]
     rr: u32,
+    #[serde(rename = "NumberOfWinsWithPlacements", default)]
+    wins: u32,
+    #[serde(rename = "NumberOfGames", default)]
+    games: u32,
+    /// Tier (as a string key) → wins at that tier.
+    #[serde(rename = "WinsByTier", default)]
+    wins_by_tier: Option<HashMap<String, u32>>,
 }
 
 #[derive(Deserialize)]
@@ -332,18 +339,29 @@ impl RiotSession {
             .collect())
     }
 
-    /// Current-act competitive rank. No entry for the act means unranked.
-    pub async fn rank(&self, puuid: &str) -> Result<Rank> {
+    /// Current-act rank plus every act this player has competitive games in.
+    /// No entry for the current act means unranked.
+    pub async fn rank(&self, puuid: &str) -> Result<RankProfile> {
         let season = self.current_season().await?;
         let url = format!("{}/mmr/v1/players/{puuid}", self.pd);
-        let dto: MmrDto = self.remote_json(|c| c.get(&url)).await?;
-        Ok(dto
-            .queue_skills
-            .get("competitive")
-            .and_then(|q| q.seasonal.as_ref())
-            .and_then(|s| s.get(season))
-            .map(|s| Rank { tier: s.tier, rr: s.rr })
-            .unwrap_or(Rank { tier: 0, rr: 0 }))
+        let mut dto: MmrDto = self.remote_json(|c| c.get(&url)).await?;
+        let seasonal = dto.queue_skills.remove("competitive").and_then(|q| q.seasonal).unwrap_or_default();
+        let current = seasonal.get(season).map(|s| Rank { tier: s.tier, rr: s.rr }).unwrap_or(Rank { tier: 0, rr: 0 });
+        let acts = seasonal
+            .into_iter()
+            .filter(|(_, s)| s.games > 0)
+            .map(|(act, s)| {
+                let peak = s.wins_by_tier.iter().flatten().filter_map(|(t, _)| t.parse().ok()).max();
+                ActRank {
+                    act: act.to_ascii_lowercase(),
+                    peak_tier: peak.unwrap_or(0).max(s.tier),
+                    tier: s.tier,
+                    wins: s.wins,
+                    games: s.games,
+                }
+            })
+            .collect();
+        Ok(RankProfile { current, acts })
     }
 
     async fn current_season(&self) -> Result<&String> {
@@ -454,12 +472,51 @@ struct GameLog {
     version: Option<String>,
 }
 
+fn game_log_path() -> Option<PathBuf> {
+    local_app_data().map(|p| p.join(r"VALORANT\Saved\Logs\ShooterGame.log"))
+}
+
+/// Follows lines appended to `ShooterGame.log` from a starting offset.
+pub struct LogTail {
+    path: PathBuf,
+    offset: u64,
+}
+
+impl LogTail {
+    /// Upper bound per read; the log grows by kilobytes per second at most.
+    const MAX_READ: u64 = 8 << 20;
+
+    /// Starts at the current end of the game log, so only future lines are seen.
+    pub fn game_log_at_end() -> Option<Self> {
+        let path = game_log_path()?;
+        let offset = std::fs::metadata(&path).ok()?.len();
+        Some(Self { path, offset })
+    }
+
+    /// Whether any complete line appended since the last call contains one of `markers`.
+    pub fn saw_any(&mut self, markers: &[String]) -> bool {
+        let Ok(mut file) = File::open(&self.path) else { return false };
+        let Ok(len) = file.metadata().map(|m| m.len()) else { return false };
+        if len < self.offset {
+            self.offset = 0; // recreated by a game restart
+        }
+        let mut buf = Vec::new();
+        if file.seek(SeekFrom::Start(self.offset)).is_err() || file.take(Self::MAX_READ).read_to_end(&mut buf).is_err()
+        {
+            return false;
+        }
+        // Consume complete lines only; a partially written last line is re-read next time.
+        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return false };
+        self.offset += end as u64 + 1;
+        let text = String::from_utf8_lossy(&buf[..end]);
+        markers.iter().any(|m| text.contains(m.as_str()))
+    }
+}
+
 /// Scans `ShooterGame.log` line by line (it can be many MB) and stops once both values are found.
 fn read_game_log() -> GameLog {
     let mut out = GameLog::default();
-    let Some(path) = local_app_data().map(|p| p.join(r"VALORANT\Saved\Logs\ShooterGame.log")) else {
-        return out;
-    };
+    let Some(path) = game_log_path() else { return out };
     let Ok(file) = File::open(path) else { return out };
     let mut reader = BufReader::new(file);
     let mut buf = Vec::new();
@@ -542,5 +599,25 @@ mod tests {
         );
         assert_eq!(parse_loop_state(&b64(r#"{"isValid":true}"#)), LoopState::Unknown);
         assert_eq!(parse_loop_state("%%not-base64%%"), LoopState::Unknown);
+    }
+
+    #[test]
+    fn log_tail_sees_only_new_complete_lines() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("vltracker-tail-{}.log", std::process::id()));
+        std::fs::write(&path, "Gameplay started at local time 0.01 (old match)\n").unwrap();
+        let mut tail = LogTail { offset: std::fs::metadata(&path).unwrap().len(), path: path.clone() };
+        let markers = vec!["Gameplay started at local time".to_owned()];
+        assert!(!tail.saw_any(&markers), "history before the start offset is ignored");
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"LogFoo: loading\nGameplay started at loc").unwrap();
+        assert!(!tail.saw_any(&markers), "partial line must not be consumed");
+        f.write_all(b"al time 0.02 (server time 0.000000)\n").unwrap();
+        assert!(tail.saw_any(&markers), "completed line is matched");
+
+        std::fs::write(&path, "Gameplay started at local time 0.03\n").unwrap();
+        assert!(tail.saw_any(&markers), "a recreated (shorter) log is read from the start");
+        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -3,8 +3,10 @@
 mod config;
 mod henrik_api;
 mod model;
+mod overlay;
 mod riot_local;
 mod val_assets;
+mod win32;
 mod worker;
 
 use std::collections::{HashMap, HashSet};
@@ -15,8 +17,10 @@ use eframe::egui::{self, Color32, RichText};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Config;
-use crate::model::{Command, Event, Fetch, IconKey, Rank, Roster, Side, Slot, Stats, Status};
+use crate::model::{Command, Event, Fetch, IconKey, RankProfile, Roster, Side, Slot, Stats, Status};
+use crate::overlay::OverlayState;
 use crate::val_assets::Assets;
+use crate::win32::Hotkey;
 
 const ICON_SIZE: f32 = 28.0;
 
@@ -37,7 +41,7 @@ fn main() -> eframe::Result {
 #[derive(Default)]
 struct PlayerInfo {
     riot_id: Option<String>,
-    rank: Fetch<Rank>,
+    rank: Fetch<RankProfile>,
     stats: Fetch<Stats>,
 }
 
@@ -64,12 +68,26 @@ struct App {
     lookup: Option<Lookup>,
     icons: HashMap<IconKey, egui::TextureHandle>,
     icons_requested: HashSet<IconKey>,
+    hotkeys: mpsc::Receiver<Hotkey>,
+    overlay: OverlayState,
 }
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
         let config = Config::load();
-        let (events, commands) = worker::spawn(ctx.clone(), config.henrik_api_key.clone());
+        let (events, commands) = worker::spawn(
+            ctx.clone(),
+            config.henrik_api_key.clone(),
+            config.overlay.round_start_markers.clone(),
+        );
+        let (hotkey_tx, hotkeys) = mpsc::channel();
+        let repaint = ctx.clone();
+        let hotkey_error = win32::spawn_hotkeys(&config.overlay.hotkey, &config.overlay.calibrate_hotkey, move |key| {
+            if hotkey_tx.send(key).is_ok() {
+                repaint.request_repaint();
+            }
+        })
+        .err();
         Self {
             events,
             commands,
@@ -78,19 +96,24 @@ impl App {
             lookup_input: String::new(),
             status: Status::WaitingForClient,
             notice: None,
-            local_notice: None,
+            local_notice: hotkey_error.map(|e| format!("Overlay hotkeys: {e}")),
             assets: None,
             roster: None,
             players: HashMap::new(),
             lookup: None,
             icons: HashMap::new(),
             icons_requested: HashSet::new(),
+            hotkeys,
+            overlay: OverlayState::default(),
         }
     }
 
     fn apply(&mut self, ctx: &egui::Context, event: Event) {
         match event {
-            Event::Status(s) => self.status = s,
+            Event::Status(s) => {
+                self.status = s;
+                self.overlay.on_status(s);
+            }
             Event::Assets(a) => self.assets = Some(a),
             Event::Roster(r) => self.roster = r,
             Event::Name { puuid, riot_id } => self.players.entry(puuid).or_default().riot_id = Some(riot_id),
@@ -137,6 +160,7 @@ impl App {
                 Status::WaitingForClient => ("Waiting for Riot Client", Color32::GRAY),
                 Status::InMenu => ("In Menu", Color32::from_rgb(120, 170, 255)),
                 Status::AgentSelect => ("Agent Select", Color32::from_rgb(240, 200, 80)),
+                Status::Loading => ("Loading Screen", Color32::from_rgb(240, 200, 80)),
                 Status::LiveMatch => ("Live Match Detected", Color32::from_rgb(90, 210, 120)),
             };
             let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -167,6 +191,12 @@ impl App {
                     self.send(Command::Lookup(query));
                 }
             }
+            ui.separator();
+            let hint = format!(
+                "Overlay: {} toggle · {} calibrate",
+                self.config.overlay.hotkey, self.config.overlay.calibrate_hotkey
+            );
+            ui.label(RichText::new(hint).small().weak());
         });
         for notice in [&self.local_notice, &self.notice].into_iter().flatten() {
             ui.label(RichText::new(notice).small().color(Color32::from_rgb(230, 170, 90)));
@@ -176,11 +206,15 @@ impl App {
     fn save_key(&mut self) {
         let key = self.key_input.trim().to_owned();
         self.config.henrik_api_key = key.clone();
+        self.save_config();
+        self.send(Command::SetApiKey(key));
+    }
+
+    fn save_config(&mut self) {
         self.local_notice = match self.config.save() {
             Ok(()) => None,
             Err(e) => Some(format!("Could not save config: {e}")),
         };
-        self.send(Command::SetApiKey(key));
     }
 
     fn lookup_panel(&mut self, ui: &mut egui::Ui) {
@@ -207,7 +241,7 @@ impl App {
                     hidden: false,
                     is_self: false,
                 };
-                self.player_grid(ui, "lookup_grid", &[slot]);
+                self.player_grid(ui, "lookup_grid", &[slot], false);
             }
             None => {}
         }
@@ -230,7 +264,7 @@ impl App {
         slots.sort_by_key(|s| !s.is_self);
         if roster.ffa {
             ui.heading("Players");
-            self.player_grid(ui, "ffa_grid", &slots);
+            self.player_grid(ui, "ffa_grid", &slots, false);
             return;
         }
 
@@ -238,34 +272,54 @@ impl App {
         let pregame = self.status == Status::AgentSelect;
         ui.columns(2, |cols| {
             cols[0].heading("My Team");
-            self.player_grid(&mut cols[0], "ally_grid", &allies);
+            self.player_grid(&mut cols[0], "ally_grid", &allies, false);
             cols[1].heading("Enemy Team");
             if enemies.is_empty() && pregame {
                 cols[1].label(RichText::new("Enemies are revealed once the match loads.").weak());
             } else {
-                self.player_grid(&mut cols[1], "enemy_grid", &enemies);
+                self.player_grid(&mut cols[1], "enemy_grid", &enemies, false);
             }
         });
     }
 
-    fn player_grid(&mut self, ui: &mut egui::Ui, id: &str, slots: &[Slot]) {
-        egui::Grid::new(id).striped(true).num_columns(6).spacing([10.0, 4.0]).show(ui, |ui| {
-            for h in ["", "", "Riot ID", "Rank", "K/D", "HS%"] {
-                ui.label(RichText::new(h).small().weak());
-            }
-            ui.end_row();
-            for slot in slots {
-                self.player_row(ui, slot);
+    fn player_grid(&mut self, ui: &mut egui::Ui, id: &str, slots: &[Slot], extended: bool) {
+        self.grouped_grid(ui, id, &[("", slots)], extended);
+    }
+
+    /// One grid so columns align across groups; a non-empty title adds a heading row before its
+    /// group. `extended` adds win rate, ACS and ADR (used by the overlay scoreboard).
+    fn grouped_grid(&mut self, ui: &mut egui::Ui, id: &str, groups: &[(&str, &[Slot])], extended: bool) {
+        let headers: &[&str] = if extended {
+            &["", "", "Riot ID", "Rank", "K/D", "HS%", "WR", "ACS", "ADR"]
+        } else {
+            &["", "", "Riot ID", "Rank", "K/D", "HS%"]
+        };
+        egui::Grid::new(id).striped(true).num_columns(headers.len()).spacing([10.0, 4.0]).show(ui, |ui| {
+            for (title, slots) in groups {
+                if !title.is_empty() {
+                    // Title sits in the Riot ID column so the narrow icon columns keep their width.
+                    ui.label("");
+                    ui.label("");
+                    ui.label(RichText::new(*title).heading());
+                    ui.end_row();
+                }
+                for h in headers {
+                    ui.label(RichText::new(*h).small().weak());
+                }
                 ui.end_row();
+                for slot in *slots {
+                    self.player_row(ui, slot, extended);
+                    ui.end_row();
+                }
             }
         });
     }
 
-    fn player_row(&mut self, ui: &mut egui::Ui, slot: &Slot) {
+    fn player_row(&mut self, ui: &mut egui::Ui, slot: &Slot, extended: bool) {
         let agent_tex = slot.agent.clone().and_then(|a| self.icon(IconKey::Agent(a)));
         let rank = self.players.get(&slot.puuid).map(|p| p.rank.clone()).unwrap_or_default();
         let rank_tex = match &rank {
-            Fetch::Ready(r) => self.icon(IconKey::Rank(r.tier)),
+            Fetch::Ready(r) => self.icon(IconKey::Rank(r.current.tier)),
             _ => None,
         };
 
@@ -282,7 +336,7 @@ impl App {
             };
             ui.label(RichText::new(text).italics().weak())
                 .on_hover_text("This player hid their name; their profile is not looked up.");
-            for _ in 0..3 {
+            for _ in 0..if extended { 6 } else { 3 } {
                 ui.label(RichText::new("—").weak());
             }
             return;
@@ -293,21 +347,27 @@ impl App {
         let name = if slot.is_self { RichText::new(name).strong().color(Color32::from_rgb(240, 200, 80)) } else { RichText::new(name) };
         ui.label(name);
 
-        let tier_name = |tier| self.assets.as_ref().and_then(|a| a.tier_name(tier)).map(str::to_owned);
-        fetch_cell(ui, &rank, |r| match r.tier {
-            0 => "Unranked".to_owned(),
-            t => format!("{} · {} RR", tier_name(t).unwrap_or_else(|| format!("Tier {t}")), r.rr),
-        });
+        fetch_cell(ui, &rank, |_| self.rank_text(&rank));
         let stats = info.map(|p| p.stats.clone()).unwrap_or_default();
         let hover = match &stats {
             Fetch::Ready(s) => Some(format!("Last {} competitive matches", s.matches)),
             _ => None,
         };
-        let kd = fetch_cell(ui, &stats, |s| format!("{:.2}", s.kd));
-        let hs = fetch_cell(ui, &stats, |s| format!("{:.0}%", s.hs_pct));
+        let mut cells = vec![
+            fetch_cell(ui, &stats, |s| format!("{:.2}", s.kd)),
+            fetch_cell(ui, &stats, |s| format!("{:.0}%", s.hs_pct)),
+        ];
+        if extended {
+            cells.push(fetch_cell(ui, &stats, |s| {
+                format!("{:.0}%", s.wins as f32 * 100.0 / (s.wins + s.losses).max(1) as f32)
+            }));
+            cells.push(fetch_cell(ui, &stats, |s| format!("{:.0}", s.acs)));
+            cells.push(fetch_cell(ui, &stats, |s| format!("{:.0}", s.adr)));
+        }
         if let Some(h) = hover {
-            kd.on_hover_text(&h);
-            hs.on_hover_text(&h);
+            for cell in cells {
+                cell.on_hover_text(&h);
+            }
         }
     }
 }
@@ -334,6 +394,15 @@ impl eframe::App for App {
         while let Ok(event) = self.events.try_recv() {
             self.apply(ctx, event);
         }
+        while let Ok(key) = self.hotkeys.try_recv() {
+            self.on_hotkey(key);
+        }
+    }
+
+    /// Transparent so the overlay window shows the game through it; the main window paints
+    /// opaque panels over the whole surface anyway.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -350,5 +419,6 @@ impl eframe::App for App {
             });
         }
         egui::CentralPanel::default().show(ui, |ui| self.match_view(ui));
+        self.show_overlay(ui.ctx());
     }
 }
