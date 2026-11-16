@@ -19,6 +19,7 @@ const TIERS_URL: &str = "https://valorant-api.com/v1/competitivetiers";
 const SEASONS_URL: &str = "https://valorant-api.com/v1/seasons";
 const COMP_SEASONS_URL: &str = "https://valorant-api.com/v1/seasons/competitive";
 const VERSION_URL: &str = "https://valorant-api.com/v1/version";
+const MAPS_URL: &str = "https://valorant-api.com/v1/maps";
 
 /// Square edge of cached icons: 32 logical px at 2x DPI scaling.
 const ICON_PX: u32 = 64;
@@ -26,6 +27,29 @@ const ICON_PX: u32 = 64;
 pub struct Agent {
     pub name: String,
     pub icon: String,
+    /// "Duelist", "Initiator", "Controller" or "Sentinel".
+    pub role: Option<String>,
+}
+
+/// A named map area at a point in game-world coordinates (the same space as match positions).
+pub struct Callout {
+    /// Super-region: "A", "B", "C", "Mid", "Attacker Side", "Defender Side".
+    pub zone: String,
+    /// e.g. "Main", "Site", "Lobby".
+    pub region: String,
+    x: f32,
+    y: f32,
+}
+
+impl Callout {
+    pub fn is_site(&self) -> bool {
+        matches!(self.zone.as_str(), "A" | "B" | "C")
+    }
+
+    /// e.g. "A Main".
+    pub fn label(&self) -> String {
+        format!("{} {}", self.zone, self.region)
+    }
 }
 
 pub struct Tier {
@@ -53,6 +77,8 @@ pub struct Assets {
     tier_maps: HashMap<String, HashMap<u32, u32>>,
     /// `riotClientVersion`, used if the local game log has no version line.
     pub client_version: Option<String>,
+    /// Callouts per map, keyed by lowercase map UUID (HenrikDev `metadata.map.id`).
+    maps: HashMap<String, Vec<Callout>>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +92,34 @@ struct AgentDto {
     uuid: String,
     display_name: String,
     display_icon: Option<String>,
+    role: Option<RoleDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoleDto {
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+struct MapDto {
+    uuid: String,
+    #[serde(default)]
+    callouts: Option<Vec<CalloutDto>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CalloutDto {
+    region_name: String,
+    super_region_name: String,
+    location: PointDto,
+}
+
+#[derive(Deserialize)]
+struct PointDto {
+    x: f32,
+    y: f32,
 }
 
 #[derive(Deserialize)]
@@ -114,11 +168,12 @@ async fn get_data<T: DeserializeOwned>(http: &reqwest::Client, url: &str) -> Res
 
 impl Assets {
     pub async fn fetch(http: &reqwest::Client) -> Result<Self> {
-        let (agents, tables, seasons, comp, version) = tokio::join!(
+        let (agents, tables, seasons, comp, maps, version) = tokio::join!(
             get_data::<Vec<AgentDto>>(http, AGENTS_URL),
             get_data::<Vec<TierTableDto>>(http, TIERS_URL),
             get_data::<Vec<SeasonDto>>(http, SEASONS_URL),
             get_data::<Vec<CompSeasonDto>>(http, COMP_SEASONS_URL),
+            get_data::<Vec<MapDto>>(http, MAPS_URL),
             get_data::<VersionDto>(http, VERSION_URL),
         );
 
@@ -126,7 +181,27 @@ impl Assets {
             .into_iter()
             .filter_map(|a| {
                 let icon = a.display_icon?;
-                Some((a.uuid.to_ascii_lowercase(), Agent { name: a.display_name, icon }))
+                let agent = Agent { name: a.display_name, icon, role: a.role.map(|r| r.display_name) };
+                Some((a.uuid.to_ascii_lowercase(), agent))
+            })
+            .collect();
+
+        // Callouts only feed the entry breakdown; without them it is simply omitted.
+        let maps = maps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| {
+                let callouts = m
+                    .callouts?
+                    .into_iter()
+                    .map(|c| Callout {
+                        zone: c.super_region_name,
+                        region: c.region_name,
+                        x: c.location.x,
+                        y: c.location.y,
+                    })
+                    .collect();
+                Some((m.uuid.to_ascii_lowercase(), callouts))
             })
             .collect();
 
@@ -167,7 +242,14 @@ impl Assets {
             })
             .collect();
 
-        Ok(Self { agents, tiers, acts, tier_maps, client_version: version.ok().map(|v| v.riot_client_version) })
+        Ok(Self {
+            agents,
+            tiers,
+            acts,
+            tier_maps,
+            client_version: version.ok().map(|v| v.riot_client_version),
+            maps,
+        })
     }
 
     /// Converts a tier number recorded during `act` to the current table's numbering.
@@ -178,6 +260,18 @@ impl Assets {
             .and_then(|t| self.tier_maps.get(t))
             .and_then(|m| m.get(&tier).copied())
             .unwrap_or(tier)
+    }
+
+    /// Nearest named area to a game-world position on `map`.
+    pub fn callout(&self, map: &str, x: f32, y: f32) -> Option<&Callout> {
+        self.maps.get(map)?.iter().min_by(|a, b| {
+            let d = |c: &Callout| (c.x - x).powi(2) + (c.y - y).powi(2);
+            d(a).total_cmp(&d(b))
+        })
+    }
+
+    pub fn agent_role(&self, uuid: &str) -> Option<&str> {
+        self.agents.get(uuid).and_then(|a| a.role.as_deref())
     }
 
     pub fn icon_url(&self, key: &IconKey) -> Option<&str> {

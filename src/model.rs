@@ -85,10 +85,10 @@ pub struct Stats {
     pub adr: f32,
 }
 
-/// Contribution to winning rounds over a player's recent competitive matches, from
-/// win-probability added (WPA): each kill, death, plant and defuse is credited with how much it
-/// moved the round-win probability.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// Contribution to winning rounds over a player's recent competitive matches. The rating is a
+/// round-swing (win-probability-added) score in the style of HLTV Rating 3.0; the remaining
+/// fields break it down by situation and role.
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct Impact {
     /// 1.00 = break-even; ±0.15 ≈ one standard deviation across players seen.
     pub rating: f32,
@@ -96,19 +96,64 @@ pub struct Impact {
     pub wpa_per_round: f32,
     pub rounds: u32,
     pub matches: u32,
+    /// Most-played agent in the sample (lowercase UUID).
+    pub main_agent: Option<String>,
     pub kills: u32,
     pub deaths: u32,
     pub opening_wins: u32,
     pub opening_losses: u32,
     /// Share of rounds with a kill, assist, survival, or traded death.
     pub kast: f32,
-    /// Kills that avenged a teammate within the trade window.
-    pub trade_kills: u32,
-    pub deaths_traded: u32,
     pub clutches: u32,
     pub clutches_won: u32,
+    /// Non-opening kills that swung the round by 25+ points.
+    pub impact_frags: u32,
     /// Kills that moved round-win probability by under 3 points (exit frags, eco kills, …).
     pub low_impact_kills: u32,
+
+    /// Trade kills within 2 s of the teammate's death, and within 2–5 s.
+    pub trades_fast: u32,
+    pub trades_late: u32,
+    pub deaths_traded: u32,
+    /// A nearby teammate died and their killer survived the next 5 s while this player was alive.
+    pub missed_refrags: u32,
+
+    /// Assists on players this player never damaged that round (flashes, debuffs, …).
+    pub util_assists: u32,
+    pub ability_kills: u32,
+    pub casts_per_round: f32,
+    /// Same agent's average across all matches the app has seen.
+    pub agent_casts_per_round: Option<f32>,
+
+    /// Attacking side's first fight inside a site area before the plant, won or lost by this player.
+    pub entry_wins: u32,
+    pub entry_losses: u32,
+    /// Most common callout of entry kills, e.g. "A Main".
+    pub entry_spot: Option<String>,
+
+    /// Attack rounds where the player's own fight (or the plant) happened far from every teammate.
+    pub lurk_rounds: u32,
+    /// Average round swing in those rounds.
+    pub lurk_swing: f32,
+    /// Isolated kills after the round was already decided.
+    pub lurk_late_kills: u32,
+    pub lurk_deaths_untraded: u32,
+
+    /// Most recent rounds first, from the latest two matches.
+    pub recent_rounds: Vec<RoundSwing>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct RoundSwing {
+    /// This player's round-win probability added in the round.
+    pub swing: f32,
+    pub won: bool,
+    pub kills: u8,
+    pub died: bool,
+    pub planted: bool,
+    pub defused: bool,
+    /// First round of a match (draw a separator before it).
+    pub match_start: bool,
 }
 
 /// Per-field load state so each cell renders independently.

@@ -18,8 +18,8 @@ use crate::model::{ActRank, Error, Rank, RankProfile, Result, Stats};
 const BASE: &str = "https://api.henrikdev.xyz/valorant/";
 /// Matches used for the per-player stat summary.
 const STATS_MATCHES: u32 = 20;
-/// Full matches used for the impact rating.
-const IMPACT_MATCHES: u32 = 5;
+/// Full matches per page for the impact rating (two pages = last 10).
+pub const IMPACT_PAGE: u32 = 5;
 /// Full-match requests can make HenrikDev fetch several matches from Riot first.
 const SLOW_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_IN_FLIGHT: usize = 3;
@@ -187,13 +187,13 @@ impl Henrik {
         aggregate(&matches).ok_or(Error::NotFound)
     }
 
-    /// Full timelines of the last `IMPACT_MATCHES` competitive games (costs 1 plus 1 per match
-    /// HenrikDev has not stored yet).
-    pub async fn recent_matches(&self, region: &str, puuid: &str) -> Result<Vec<MatchDto>> {
-        let size = IMPACT_MATCHES.to_string();
+    /// One page of full competitive match timelines, newest first, starting `start` matches back
+    /// (costs 1 plus 1 per match HenrikDev has not stored yet).
+    pub async fn recent_matches(&self, region: &str, puuid: &str, start: u32) -> Result<Vec<MatchDto>> {
+        let (size, start) = (IMPACT_PAGE.to_string(), start.to_string());
         self.get(
             &["v4", "by-puuid", "matches", region, "pc", puuid],
-            &[("mode", "competitive"), ("size", &size)],
+            &[("mode", "competitive"), ("size", &size), ("start", &start)],
             Some(SLOW_TIMEOUT),
         )
         .await

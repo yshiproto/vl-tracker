@@ -11,12 +11,14 @@
 use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, RichText, Sense, Vec2, ViewportId};
 
 use crate::config::OverlayConfig;
-use crate::model::{Fetch, IconKey, Impact, RankProfile, Side, Slot, Status};
+use crate::model::{Fetch, IconKey, Impact, RankProfile, RoundSwing, Side, Slot, Status};
+use crate::val_assets::Assets;
 use crate::win32::{self, Hotkey};
 use crate::{App, Columns, PlayerInfo, impact_label};
 
 const BOX_SIZE: Vec2 = Vec2::new(250.0, 58.0);
-const CARD_WIDTH: f32 = 300.0;
+const CARD_WIDTH: f32 = 340.0;
+const STRIP_HEIGHT: f32 = 34.0;
 const BADGE: f32 = 24.0;
 const INTERACTIVE_TITLE: &str = "vltracker overlay (interactive)";
 const PASSTHROUGH_TITLE: &str = "vltracker overlay";
@@ -376,9 +378,9 @@ impl App {
 
         ui.add_space(4.0);
         match info.map(|p| p.impact.clone()).unwrap_or_default() {
-            Fetch::Ready(i) => impact_section(ui, &i),
+            Fetch::Ready(i) => impact_section(ui, &i, self.assets.as_deref()),
             Fetch::Pending => {
-                ui.label(RichText::new("Calculating impact from the last 5 matches…").weak());
+                ui.label(RichText::new("Calculating impact from the last 10 matches…").weak());
             }
             Fetch::Unavailable(reason) => {
                 ui.label(RichText::new(format!("Impact unavailable: {reason}")).weak());
@@ -479,11 +481,16 @@ fn act_label(app: &App, act: &str) -> String {
     app.assets.as_ref().and_then(|a| a.acts.get(act)).map_or_else(|| "Unknown act".into(), |a| a.label.clone())
 }
 
-fn impact_section(ui: &mut egui::Ui, i: &Impact) {
+fn impact_section(ui: &mut egui::Ui, i: &Impact, assets: Option<&Assets>) {
     let (label, color) = impact_label(i.rating);
+    let agent = i.main_agent.as_deref();
+    let role = agent.and_then(|a| assets?.agent_role(a));
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("Impact {:.2}", i.rating)).strong().size(15.0).color(color));
         ui.label(RichText::new(label).color(color));
+        if let (Some(role), Some(name)) = (role, agent.and_then(|a| assets?.agent_name(a))) {
+            ui.label(RichText::new(format!("· {role} ({name})")).weak());
+        }
     });
     ui.label(
         RichText::new(format!(
@@ -495,16 +502,76 @@ fn impact_section(ui: &mut egui::Ui, i: &Impact) {
         .small()
         .weak(),
     );
+    round_strip(ui, &i.recent_rounds);
+
     ui.label(format!(
-        "Opening duels {}–{} · KAST {:.0}% · Clutches {}/{}",
+        "Opening duels {}–{} · KAST {:.0}% · Clutches {}/{} · Impact frags {}",
         i.opening_wins,
         i.opening_losses,
         i.kast * 100.0,
         i.clutches_won,
-        i.clutches
-    ));
+        i.clutches,
+        i.impact_frags
+    ))
+    .on_hover_text("Impact frags: kills after the opening duel that swung the round by 25+ points");
+
+    // Role-specific lines; the one that matters most for the role goes first and bold.
     let traded = i.deaths_traded as f32 * 100.0 / i.deaths.max(1) as f32;
-    ui.label(format!("Trade kills {} · Deaths traded {traded:.0}%", i.trade_kills));
+    let trades = (
+        format!(
+            "Trades {} instant · {} late · deaths traded {traded:.0}% · missed refrags {}",
+            i.trades_fast, i.trades_late, i.missed_refrags
+        ),
+        "Instant: within 2 s of the teammate's death; late: 2–5 s. Missed refrag: a teammate died within \
+         ~15 m of you and their killer survived the next 5 s.",
+    );
+    let util = (
+        format!(
+            "Utility: {} util assists · {} ability kills · {:.1} casts/rd{}",
+            i.util_assists,
+            i.ability_kills,
+            i.casts_per_round,
+            i.agent_casts_per_round.map(|a| format!(" (agent avg {a:.1})")).unwrap_or_default()
+        ),
+        "Util assists: assists on players you never damaged that round (flashes, debuffs). \
+         Casts are match totals; usage alone isn't rated.",
+    );
+    let entry = (i.entry_wins + i.entry_losses > 0).then(|| {
+        let rate = i.entry_wins as f32 * 100.0 / (i.entry_wins + i.entry_losses) as f32;
+        let spot = i.entry_spot.as_deref().map(|s| format!(", mostly {s}")).unwrap_or_default();
+        (
+            format!("Site entries {}W–{}L ({rate:.0}%){spot}", i.entry_wins, i.entry_losses),
+            "The attackers' first fight inside a site area before the plant, won or lost by this player.",
+        )
+    });
+    let lurk = (i.lurk_rounds > 0).then(|| {
+        (
+            format!(
+                "Lurks {} rounds · {:+.1}%/rd swing · {} late kills · {} untraded deaths",
+                i.lurk_rounds,
+                i.lurk_swing * 100.0,
+                i.lurk_late_kills,
+                i.lurk_deaths_untraded
+            ),
+            "Attack rounds where your own fight (or a solo plant) happened ~30 m+ from every teammate before \
+             the plant. Late kills: isolated kills after the round was already decided.",
+        )
+    });
+    let mut lines: Vec<(String, &str)> = [Some(trades), Some(util), entry, lurk].into_iter().flatten().collect();
+    let lead = match role {
+        Some("Duelist") => lines.iter().position(|(l, _)| l.starts_with("Site entries")),
+        Some("Sentinel") => lines.iter().position(|(l, _)| l.starts_with("Lurks")),
+        Some("Initiator" | "Controller") => lines.iter().position(|(l, _)| l.starts_with("Utility")),
+        _ => None,
+    };
+    if let Some(lead) = lead {
+        let (text, hint) = lines.remove(lead);
+        ui.label(RichText::new(text).strong()).on_hover_text(hint);
+    }
+    for (text, hint) in lines {
+        ui.label(text).on_hover_text(hint);
+    }
+
     if i.kills > 0 {
         let low = i.low_impact_kills as f32 * 100.0 / i.kills as f32;
         ui.label(format!("Low-impact kills {low:.0}% of {}", i.kills))
@@ -512,6 +579,56 @@ fn impact_section(ui: &mut egui::Ui, i: &Impact) {
     }
     if let Some(note) = impact_note(i) {
         ui.label(RichText::new(note).italics().color(color));
+    }
+}
+
+/// One bar per round (oldest left): up = round-win probability added, down = lost. A tick under
+/// each bar marks rounds the team won; a gap separates matches. Hover for the round.
+fn round_strip(ui: &mut egui::Ui, rounds: &[RoundSwing]) {
+    if rounds.is_empty() {
+        return;
+    }
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(CARD_WIDTH, STRIP_HEIGHT), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let gaps = rounds.iter().filter(|r| r.match_start).count().saturating_sub(1) as f32;
+    let slot = ((rect.width() - gaps * 4.0) / rounds.len() as f32).min(10.0);
+    let mid = rect.center().y - 3.0;
+    let half = STRIP_HEIGHT / 2.0 - 5.0;
+    painter.hline(rect.x_range(), mid, egui::Stroke::new(1.0, Color32::from_white_alpha(30)));
+
+    let mut x = rect.left();
+    let mut hovered = None;
+    let mut round_no = 0;
+    for (idx, r) in rounds.iter().enumerate() {
+        if r.match_start {
+            if idx > 0 {
+                x += 4.0;
+            }
+            round_no = 0;
+        }
+        round_no += 1;
+        let height = (r.swing.abs() / 0.5).min(1.0) * half;
+        let (top, bottom) = if r.swing >= 0.0 { (mid - height, mid) } else { (mid, mid + height) };
+        let color = if r.swing >= 0.0 { Color32::from_rgb(90, 210, 120) } else { Color32::from_rgb(230, 110, 100) };
+        let bar = Rect::from_min_max(Pos2::new(x + 1.0, top), Pos2::new(x + slot - 1.0, bottom.max(top + 1.0)));
+        painter.rect_filled(bar, 1.0, color);
+        let tick = if r.won { Color32::from_white_alpha(140) } else { Color32::from_white_alpha(25) };
+        let tick_rect = Rect::from_min_max(Pos2::new(x + 1.0, rect.bottom() - 3.0), Pos2::new(x + slot - 1.0, rect.bottom()));
+        painter.rect_filled(tick_rect, 0.0, tick);
+        if response.hover_pos().is_some_and(|p| p.x >= x && p.x < x + slot) {
+            hovered = Some((round_no, r));
+        }
+        x += slot;
+    }
+    if let Some((n, r)) = hovered {
+        let mut text = format!("Round {n}: {:+.1}% · {} kill{}", r.swing * 100.0, r.kills, if r.kills == 1 { "" } else { "s" });
+        for (flag, label) in [(r.died, "died"), (r.planted, "planted"), (r.defused, "defused")] {
+            if flag {
+                text.push_str(&format!(" · {label}"));
+            }
+        }
+        text.push_str(if r.won { " · won" } else { " · lost" });
+        response.on_hover_text_at_pointer(text);
     }
 }
 
