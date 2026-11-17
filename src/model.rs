@@ -90,12 +90,29 @@ pub struct Stats {
 /// fields break it down by situation and role.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Impact {
-    /// 1.00 = break-even; ±0.15 ≈ one standard deviation across players seen.
+    /// 1.00 = no measured advantage; +0.15 = +0.03 observed WPA per round after shrinkage.
     pub rating: f32,
     /// Round-win probability added per round, shrunk toward 0 for small samples (0.023 = +2.3%).
     pub wpa_per_round: f32,
+    /// 0–1: how much of the rating is the player's own data rather than shrinkage toward
+    /// break-even. Rises with rounds and falls with round-to-round noise.
+    pub reliability: f32,
+    /// Standard deviation of per-match WPA/round: low = steady, high = streaky.
+    pub consistency_sd: f32,
+    /// Average competitive tier of opponents faced (current table), 0 if unknown.
+    pub opponent_tier: f32,
+    /// Tiers of the player's own rank above the opponents' (negative = punching up).
+    pub tier_gap: f32,
+    /// Rounds played on attack / defence and WPA per round on each.
+    pub attack_rounds: u32,
+    pub defence_rounds: u32,
+    pub attack_wpa: f32,
+    pub defence_wpa: f32,
     pub rounds: u32,
     pub matches: u32,
+    /// `matches` is the player's whole fetched competitive history; true when nothing further
+    /// back is known to exist. The act scope is then complete even if it covers few games.
+    pub history_complete: bool,
     /// Most-played agent in the sample (lowercase UUID).
     pub main_agent: Option<String>,
     pub kills: u32,
@@ -188,11 +205,64 @@ pub enum Event {
     Name { puuid: String, riot_id: String },
     Rank { puuid: String, rank: Fetch<RankProfile> },
     Stats { puuid: String, stats: Fetch<Stats> },
-    Impact { puuid: String, impact: Fetch<Impact> },
+    /// `depth` is the deepest level the impact covers so far.
+    Impact { puuid: String, depth: Depth, impact: Fetch<Impact> },
+    /// Fetch progress for a player's deep stats.
+    ImpactProgress { puuid: String, progress: Progress },
     Icon { key: IconKey, image: egui::ColorImage },
     LookupResolved { query: String, puuid: String },
     LookupFailed { query: String, reason: String },
     Notice(Option<String>),
+    /// HenrikDev quota: requests left in the window and seconds until it resets.
+    Quota { remaining: u32, reset_secs: u32 },
+}
+
+/// How many matches the impact rating covers.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum Depth {
+    #[default]
+    Last10,
+    Last20,
+    /// Every competitive match of the current act.
+    Act,
+}
+
+impl Depth {
+    pub fn label(self) -> &'static str {
+        match self {
+            Depth::Last10 => "Last 10",
+            Depth::Last20 => "Last 20",
+            Depth::Act => "This act",
+        }
+    }
+
+    /// The combo-box wording: the act target is a safety cap on an unbounded fetch.
+    pub fn selector_label(self) -> &'static str {
+        match self {
+            Depth::Act => "This act (max 300)",
+            d => d.label(),
+        }
+    }
+
+    /// Rating scope label; `history_complete` narrows "This act" to the matches actually
+    /// played in it, distinguishing an act regular from a smurf with three games.
+    pub fn scope(self, matches: u32, history_complete: bool) -> String {
+        match self {
+            Depth::Last10 => format!("Last {matches}"),
+            Depth::Last20 => format!("Last {matches}"),
+            Depth::Act if history_complete => format!("Act · all {matches}"),
+            Depth::Act => format!("Act · {matches}+"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Progress {
+    /// Fetching page `page` toward `target`; `have` matches so far.
+    Fetching { have: u32, target: Depth },
+    /// Waiting for the HenrikDev window to reset.
+    RateLimited { have: u32, target: Depth, resume_secs: u32 },
+    Done,
 }
 
 /// UI → worker.
@@ -200,6 +270,8 @@ pub enum Command {
     SetApiKey(String),
     Lookup(String),
     LoadIcon(IconKey),
+    /// How deep to fetch for everyone in the lobby.
+    SetDepth(Depth),
 }
 
 /// Sends events to the UI and wakes it. The only source of repaints besides user input.

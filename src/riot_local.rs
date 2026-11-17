@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use base64::Engine;
+use parking_lot::Mutex;
 use reqwest::{RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -364,6 +364,11 @@ impl RiotSession {
         Ok(RankProfile { current, acts })
     }
 
+    /// Lowercase UUID of the active act, from Riot's content service.
+    pub async fn current_act(&self) -> Result<String> {
+        self.current_season().await.map(|s| s.to_ascii_lowercase())
+    }
+
     async fn current_season(&self) -> Result<&String> {
         self.season
             .get_or_try_init(|| async {
@@ -381,7 +386,7 @@ impl RiotSession {
     async fn refresh_tokens(&self) -> Result<()> {
         let ent: EntitlementsDto =
             local_get(&self.local, &self.local_base, &self.password, "/entitlements/v1/token").await?;
-        *self.tokens.lock().unwrap_or_else(|e| e.into_inner()) =
+        *self.tokens.lock() =
             Tokens { access: ent.access_token, entitlements: ent.token };
         Ok(())
     }
@@ -390,7 +395,7 @@ impl RiotSession {
     async fn remote_json<T: DeserializeOwned>(&self, build: impl Fn(&reqwest::Client) -> RequestBuilder) -> Result<T> {
         for attempt in 0..2 {
             let (access, entitlements) = {
-                let t = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+                let t = self.tokens.lock();
                 (t.access.clone(), t.entitlements.clone())
             };
             let resp = build(&self.remote)

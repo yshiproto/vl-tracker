@@ -4,8 +4,11 @@ mod config;
 mod details;
 mod henrik_api;
 mod impact;
+mod match_cache;
 mod model;
 mod overlay;
+#[cfg(test)]
+mod realcheck;
 mod riot_local;
 mod val_assets;
 mod win32;
@@ -19,7 +22,9 @@ use eframe::egui::{self, Color32, RichText};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Config;
-use crate::model::{Command, Event, Fetch, IconKey, Impact, RankProfile, Roster, Side, Slot, Stats, Status};
+use crate::model::{
+    Command, Depth, Event, Fetch, IconKey, Impact, Progress, RankProfile, Roster, Side, Slot, Stats, Status,
+};
 use crate::overlay::OverlayState;
 use crate::val_assets::Assets;
 use crate::win32::Hotkey;
@@ -46,6 +51,9 @@ struct PlayerInfo {
     rank: Fetch<RankProfile>,
     stats: Fetch<Stats>,
     impact: Fetch<Impact>,
+    /// Deepest level `impact` covers so far.
+    impact_depth: Depth,
+    progress: Option<Progress>,
 }
 
 enum Lookup {
@@ -75,16 +83,24 @@ struct App {
     overlay: OverlayState,
     /// Player shown in the main window's details panel.
     details: Option<String>,
+    /// Requested impact depth for everyone.
+    depth: Depth,
+    /// (remaining requests, seconds to reset, when reported).
+    quota: Option<(u32, u32, std::time::Instant)>,
 }
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
         let config = Config::load();
-        let (events, commands) = worker::spawn(
-            ctx.clone(),
-            config.henrik_api_key.clone(),
-            config.overlay.round_start_markers.clone(),
-        );
+        // The on-disk key wins; an env key only bootstraps a fresh config (used by the headless
+        // visual check on machines with no saved key).
+        let api_key = if config.henrik_api_key.is_empty() {
+            std::env::var("HENRIK_KEY").unwrap_or_default()
+        } else {
+            config.henrik_api_key.clone()
+        };
+        let (events, commands) =
+            worker::spawn(ctx.clone(), api_key.clone(), config.overlay.round_start_markers.clone());
         let (hotkey_tx, hotkeys) = mpsc::channel();
         let repaint = ctx.clone();
         let hotkey_error = win32::spawn_hotkeys(&config.overlay.hotkey, &config.overlay.calibrate_hotkey, move |key| {
@@ -96,7 +112,7 @@ impl App {
         Self {
             events,
             commands,
-            key_input: config.henrik_api_key.clone(),
+            key_input: api_key,
             config,
             lookup_input: String::new(),
             status: Status::WaitingForClient,
@@ -111,6 +127,8 @@ impl App {
             hotkeys,
             overlay: OverlayState::default(),
             details: None,
+            depth: Depth::Last10,
+            quota: None,
         }
     }
 
@@ -125,7 +143,17 @@ impl App {
             Event::Name { puuid, riot_id } => self.players.entry(puuid).or_default().riot_id = Some(riot_id),
             Event::Rank { puuid, rank } => self.players.entry(puuid).or_default().rank = rank,
             Event::Stats { puuid, stats } => self.players.entry(puuid).or_default().stats = stats,
-            Event::Impact { puuid, impact } => self.players.entry(puuid).or_default().impact = impact,
+            Event::Impact { puuid, depth, impact } => {
+                let p = self.players.entry(puuid).or_default();
+                p.impact = impact;
+                p.impact_depth = depth;
+            }
+            Event::ImpactProgress { puuid, progress } => {
+                self.players.entry(puuid).or_default().progress = Some(progress);
+            }
+            Event::Quota { remaining, reset_secs } => {
+                self.quota = Some((remaining, reset_secs, std::time::Instant::now()));
+            }
             Event::Icon { key, image } => {
                 let tex = ctx.load_texture(format!("{key:?}"), image, egui::TextureOptions::LINEAR);
                 self.icons.insert(key, tex);
@@ -164,7 +192,7 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let (label, color) = match self.status {
                 Status::WaitingForClient => ("Waiting for Riot Client", Color32::GRAY),
                 Status::InMenu => ("In Menu", Color32::from_rgb(120, 170, 255)),
@@ -201,11 +229,34 @@ impl App {
                 }
             }
             ui.separator();
+            ui.label("Impact over");
+            let mut depth = self.depth;
+            egui::ComboBox::from_id_salt("depth").selected_text(depth.selector_label()).show_ui(ui, |ui| {
+                for d in [Depth::Last10, Depth::Last20, Depth::Act] {
+                    ui.selectable_value(&mut depth, d, d.selector_label());
+                }
+            });
+            if depth != self.depth {
+                self.depth = depth;
+                for player in self.players.values_mut() {
+                    player.progress = Some(Progress::Fetching { have: 0, target: depth });
+                }
+                self.send(Command::SetDepth(depth));
+            }
+            ui.separator();
             let hint = format!(
                 "Overlay: {} toggle · {} calibrate",
                 self.config.overlay.hotkey, self.config.overlay.calibrate_hotkey
             );
             ui.label(RichText::new(hint).small().weak());
+            if let Some((remaining, reset, at)) = self.quota {
+                ui.separator();
+                let reset = reset.saturating_sub(at.elapsed().as_secs() as u32);
+                let text = format!("API quota {remaining} left · resets in {reset}s");
+                let color = if remaining < 10 { Color32::from_rgb(230, 170, 90) } else { Color32::from_gray(140) };
+                ui.label(RichText::new(text).small().color(color))
+                    .on_hover_text("HenrikDev free tier: 30 requests/min, including its own calls to Riot");
+            }
         });
         for notice in [&self.local_notice, &self.notice].into_iter().flatten() {
             ui.label(RichText::new(notice).small().color(Color32::from_rgb(230, 170, 90)));
@@ -390,7 +441,8 @@ impl App {
         fetch_cell(ui, &rank, |_| self.rank_text(&rank));
         if columns == Columns::Main {
             let impact = info.map(|p| p.impact.clone()).unwrap_or_default();
-            impact_cell(ui, &impact);
+            let depth = info.map(|p| p.impact_depth).unwrap_or_default();
+            impact_cell(ui, &impact, depth);
         }
         let stats = info.map(|p| p.stats.clone()).unwrap_or_default();
         let hover = match &stats {
@@ -448,17 +500,21 @@ fn impact_label(rating: f32) -> (&'static str, Color32) {
     }
 }
 
-fn impact_cell(ui: &mut egui::Ui, impact: &Fetch<Impact>) {
+fn impact_cell(ui: &mut egui::Ui, impact: &Fetch<Impact>, depth: Depth) {
     let Fetch::Ready(i) = impact else {
         fetch_cell(ui, impact, |_| String::new());
         return;
     };
     let (label, color) = impact_label(i.rating);
+    let suffix = match depth {
+        Depth::Act if i.history_complete => format!("all {} act matches", i.matches),
+        Depth::Act => format!("{}+ act matches", i.matches),
+        _ => format!("last {} competitive matches", i.matches),
+    };
     ui.label(RichText::new(format!("{:.2}", i.rating)).color(color).strong()).on_hover_text(format!(
-        "{label}: {:+.1}% round-win probability per round over {} rounds (last {} competitive matches)",
+        "{label}: {:+.1}% round-win probability per round over {} rounds ({suffix})",
         i.wpa_per_round * 100.0,
-        i.rounds,
-        i.matches
+        i.rounds
     ));
 }
 
@@ -478,6 +534,9 @@ impl eframe::App for App {
         }
         while let Ok(key) = self.hotkeys.try_recv() {
             self.on_hotkey(key);
+        }
+        if self.quota.is_some() || self.players.values().any(|p| matches!(p.progress, Some(Progress::RateLimited { .. }))) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 

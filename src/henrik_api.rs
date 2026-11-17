@@ -4,8 +4,8 @@
 //! not knowable up front. The gate trusts the server: it follows `X-RateLimit-Remaining` /
 //! `X-RateLimit-Reset`, pauses at zero, and honours `Retry-After` on 429.
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use parking_lot::Mutex;
 
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
@@ -126,10 +126,22 @@ struct Budget {
     reset_at: Instant,
 }
 
+/// Snapshot of the HenrikDev window for the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quota {
+    pub remaining: u32,
+    pub reset_secs: u32,
+}
+
+/// Reserve cheap lookups plus the possible cost of an uncached five-match page.
+const CHEAP_RESERVE: u32 = 4;
+const DEEP_PAGE_COST: u32 = IMPACT_PAGE + 1;
+
 pub struct Henrik {
     http: reqwest::Client,
     key: Mutex<String>,
     in_flight: Semaphore,
+    deep_in_flight: Semaphore,
     budget: Mutex<Budget>,
 }
 
@@ -139,12 +151,16 @@ impl Henrik {
             http,
             key: Mutex::new(key),
             in_flight: Semaphore::new(MAX_IN_FLIGHT),
+            deep_in_flight: Semaphore::new(1),
             budget: Mutex::new(Budget { remaining: None, reset_at: Instant::now() }),
         }
     }
 
     pub fn set_key(&self, key: String) {
-        *self.key.lock().unwrap_or_else(|e| e.into_inner()) = key;
+        *self.key.lock() = key;
+        let mut budget = self.budget.lock();
+        budget.remaining = None;
+        budget.reset_at = Instant::now();
     }
 
     pub async fn account(&self, name: &str, tag: &str) -> Result<Account> {
@@ -190,6 +206,10 @@ impl Henrik {
     /// One page of full competitive match timelines, newest first, starting `start` matches back
     /// (costs 1 plus 1 per match HenrikDev has not stored yet).
     pub async fn recent_matches(&self, region: &str, puuid: &str, start: u32) -> Result<Vec<MatchDto>> {
+        let _deep = self.deep_in_flight.acquire().await.expect("semaphore never closed");
+        while let wait @ 1.. = self.deep_wait_secs() {
+            tokio::time::sleep(Duration::from_secs(wait.into())).await;
+        }
         let (size, start) = (IMPACT_PAGE.to_string(), start.to_string());
         self.get(
             &["v4", "by-puuid", "matches", region, "pc", puuid],
@@ -205,7 +225,7 @@ impl Henrik {
         query: &[(&str, &str)],
         timeout: Option<Duration>,
     ) -> Result<T> {
-        let key = self.key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let key = self.key.lock().clone();
         if key.is_empty() {
             return Err(Error::NoApiKey);
         }
@@ -235,12 +255,31 @@ impl Henrik {
         Err(Error::RateLimited)
     }
 
+    /// Current window as last reported by the server (`None` before the first response).
+    pub fn quota(&self) -> Option<Quota> {
+        let b = self.budget.lock();
+        let reset_secs = b.reset_at.saturating_duration_since(Instant::now()).as_secs().saturating_add(1) as u32;
+        b.remaining.map(|remaining| Quota { remaining, reset_secs })
+    }
+
+    /// Seconds a deep fetch should wait before its next page; cheap calls retain headroom
+    /// even if HenrikDev needs to fetch all five matches from Riot. 0 when it can go now.
+    pub fn deep_wait_secs(&self) -> u32 {
+        let b = self.budget.lock();
+        let now = Instant::now();
+        if b.remaining.is_some_and(|n| n < CHEAP_RESERVE + DEEP_PAGE_COST) && now < b.reset_at {
+            b.reset_at.duration_since(now).as_secs().saturating_add(1) as u32
+        } else {
+            0
+        }
+    }
+
     /// Bounds concurrency and waits out an exhausted window.
     async fn acquire(&self) -> SemaphorePermit<'_> {
         let permit = self.in_flight.acquire().await.expect("semaphore never closed");
         loop {
             let wait = {
-                let mut b = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+                let mut b = self.budget.lock();
                 let now = Instant::now();
                 match b.remaining {
                     Some(0) if now < b.reset_at => Some(b.reset_at - now),
@@ -265,7 +304,7 @@ impl Henrik {
 
     fn observe(&self, resp: &reqwest::Response) {
         let header = |name: &str| -> Option<u64> { resp.headers().get(name)?.to_str().ok()?.trim().parse().ok() };
-        let mut b = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+        let mut b = self.budget.lock();
         if resp.status() == StatusCode::TOO_MANY_REQUESTS {
             let secs = header("retry-after").or_else(|| header("x-ratelimit-reset")).unwrap_or(60);
             b.remaining = Some(0);
@@ -340,5 +379,20 @@ mod tests {
         assert_eq!(s.acs, 8000.0 / 64.0);
         assert_eq!(s.adr, 4000.0 / 64.0);
         assert!(aggregate(&[]).is_none());
+    }
+
+    #[test]
+    fn deep_gate_reserves_full_page_and_reopens_after_reset() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let api = Henrik::new(reqwest::Client::new(), "unused".into());
+        let mut b = api.budget.lock();
+        b.remaining = Some(CHEAP_RESERVE + DEEP_PAGE_COST);
+        b.reset_at = Instant::now() + Duration::from_secs(60);
+        drop(b);
+        assert_eq!(api.deep_wait_secs(), 0);
+        api.budget.lock().remaining = Some(CHEAP_RESERVE + DEEP_PAGE_COST - 1);
+        assert!(api.deep_wait_secs() >= 60);
+        api.budget.lock().reset_at = Instant::now() - Duration::from_secs(1);
+        assert_eq!(api.deep_wait_secs(), 0, "an expired window must not wait forever");
     }
 }

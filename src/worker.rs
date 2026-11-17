@@ -9,17 +9,20 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use eframe::egui;
+use parking_lot::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
 use crate::henrik_api::{Account, Henrik, IMPACT_PAGE};
-use crate::impact::{self, WinModel};
-use crate::model::{Command, Error, Event, Fetch, IconKey, Result, Roster, Status, UiSink};
+use crate::impact::{self, MatchDto, WinModel};
+use crate::match_cache::MatchCache;
+use crate::model::{Command, Depth, Error, Event, Fetch, IconKey, Progress, Result, Roster, Status, UiSink};
 use crate::riot_local::{LogTail, Lockfile, LoopState, RiotSession};
 use crate::val_assets::{self, Assets};
 
@@ -33,6 +36,8 @@ const LOADING_MAX: Duration = Duration::from_secs(120);
 const ASSET_RETRY: Duration = Duration::from_secs(60);
 /// Rank/stats are not re-requested for a player seen within this window.
 const PLAYER_TTL: Duration = Duration::from_secs(30 * 60);
+/// Safety limit for unusually long histories; the UI labels this as an upper bound.
+const ACT_MATCH_CAP: u32 = 300;
 
 pub fn spawn(
     ctx: egui::Context,
@@ -63,7 +68,7 @@ pub fn spawn(
 
 enum TaskDone {
     /// `ok == false` means a transient failure; the player is re-scheduled on the next tick.
-    Player { puuid: String, ok: bool },
+    Player { puuid: String, ok: bool, cheap_ok: bool, depth: Depth, had_assets: bool },
     Lookup { query: String, result: Result<Account> },
 }
 
@@ -82,7 +87,10 @@ struct Worker {
     remote: reqwest::Client,
     henrik: Arc<Henrik>,
     /// Shared by player jobs; learns from every match fetched and persists to disk.
-    win_model: Arc<std::sync::Mutex<WinModel>>,
+    win_model: Arc<Mutex<WinModel>>,
+    cache: Arc<Mutex<MatchCache>>,
+    /// Requested impact depth, shared with running jobs.
+    depth: Arc<AtomicU8>,
     assets: Option<Arc<Assets>>,
     assets_retry_at: Instant,
     icons_waiting: Vec<IconKey>,
@@ -93,7 +101,11 @@ struct Worker {
     roster: Option<Roster>,
     roster_is_core: bool,
     named: HashSet<String>,
-    fetched: HashMap<String, Instant>,
+    lookup_query: Option<String>,
+    lookup_target: Option<(String, String)>,
+    fetched: HashMap<String, (Instant, Depth)>,
+    cheap_fetched: HashMap<String, Instant>,
+    in_flight: HashSet<String>,
     tasks: JoinSet<TaskDone>,
     round_start_markers: Vec<String>,
     /// Armed during agent select at the log's end, so the loading screen's lines can be followed.
@@ -115,7 +127,9 @@ impl Worker {
         Ok(Self {
             ui,
             henrik: Arc::new(Henrik::new(remote.clone(), api_key)),
-            win_model: Arc::new(std::sync::Mutex::new(WinModel::load())),
+            win_model: Arc::new(Mutex::new(WinModel::load())),
+            cache: Arc::new(Mutex::new(MatchCache::load())),
+            depth: Arc::new(AtomicU8::new(depth_to_u8(Depth::Last10))),
             local,
             remote,
             assets: None,
@@ -128,7 +142,11 @@ impl Worker {
             roster: None,
             roster_is_core: false,
             named: HashSet::new(),
+            lookup_query: None,
+            lookup_target: None,
             fetched: HashMap::new(),
+            cheap_fetched: HashMap::new(),
+            in_flight: HashSet::new(),
             tasks: JoinSet::new(),
             round_start_markers,
             log_tail: None,
@@ -162,28 +180,46 @@ impl Worker {
             Command::SetApiKey(key) => {
                 self.henrik.set_key(key);
                 // Re-fetch rows that failed for lack of a key.
+                self.cheap_fetched.clear();
                 self.fetched.clear();
                 self.schedule_roster();
             }
             Command::Lookup(query) => self.lookup(query),
             Command::LoadIcon(key) => self.load_icon(key),
+            Command::SetDepth(depth) => {
+                self.depth.store(depth_to_u8(depth), Ordering::Relaxed);
+                // In-flight jobs observe the shared target; never launch a second job for one
+                // player or repeat cheap rank/stats requests just because the scope changed.
+                self.schedule_roster();
+            }
         }
     }
 
     fn task_done(&mut self, done: TaskDone) {
         match done {
-            TaskDone::Player { puuid, ok } => {
-                if !ok {
+            TaskDone::Player { puuid, ok, cheap_ok, depth, had_assets } => {
+                if cheap_ok {
+                    self.cheap_fetched.insert(puuid.clone(), Instant::now());
+                }
+                self.in_flight.remove(&puuid);
+                let changed = self.depth.load(Ordering::Relaxed) != depth_to_u8(depth);
+                let needs_assets = depth == Depth::Act && !had_assets && self.assets.is_some();
+                if !ok || changed || needs_assets {
                     self.fetched.remove(&puuid);
+                }
+                if changed || needs_assets {
+                    self.schedule_roster();
                 }
             }
             TaskDone::Lookup { query, result } => match result {
-                Ok(account) => {
+                Ok(account) if self.lookup_query.as_deref() == Some(&query) => {
                     self.named.insert(account.puuid.clone());
                     self.ui.send(Event::Name { puuid: account.puuid.clone(), riot_id: account.riot_id });
                     self.ui.send(Event::LookupResolved { query, puuid: account.puuid.clone() });
+                    self.lookup_target = Some((account.puuid.clone(), account.region.clone()));
                     self.schedule(&account.puuid, &account.region);
                 }
+                Ok(_) => {}
                 Err(e) => {
                     let reason = match e {
                         Error::NotFound => "Player not found".to_owned(),
@@ -348,36 +384,57 @@ impl Worker {
         self.schedule_roster();
     }
 
-    /// Queue rank/stats fetches for every visible player in the current roster.
+    /// Queue visible roster players and the manually searched player, if any.
     fn schedule_roster(&mut self) {
-        let (Some(roster), Some(session)) = (&self.roster, &self.session) else { return };
-        let region = session.region.clone();
-        let puuids: Vec<String> = roster.slots.iter().filter(|s| !s.hidden).map(|s| s.puuid.clone()).collect();
-        for puuid in puuids {
+        let roster = match (&self.roster, &self.session) {
+            (Some(roster), Some(session)) => roster
+                .slots
+                .iter()
+                .filter(|s| !s.hidden)
+                .map(|s| (s.puuid.clone(), session.region.clone()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        for (puuid, region) in roster {
+            self.schedule(&puuid, &region);
+        }
+        if let Some((puuid, region)) = self.lookup_target.clone() {
             self.schedule(&puuid, &region);
         }
     }
 
     fn schedule(&mut self, puuid: &str, region: &str) {
-        if self.fetched.get(puuid).is_some_and(|t| t.elapsed() < PLAYER_TTL) {
+        let depth = depth_from_u8(self.depth.load(Ordering::Relaxed));
+        if self.in_flight.contains(puuid) {
             return;
         }
-        self.fetched.insert(puuid.to_owned(), Instant::now());
+        let cheap_fresh = self.cheap_fetched.get(puuid).is_some_and(|t| t.elapsed() < PLAYER_TTL);
+        if self.fetched.get(puuid).is_some_and(|(t, d)| t.elapsed() < PLAYER_TTL && *d == depth) {
+            return;
+        }
+        self.in_flight.insert(puuid.to_owned());
+        self.fetched.insert(puuid.to_owned(), (Instant::now(), depth));
         let job = PlayerJob {
             session: self.session.clone(),
             henrik: self.henrik.clone(),
             win_model: self.win_model.clone(),
+            cache: self.cache.clone(),
+            depth: self.depth.clone(),
             assets: self.assets.clone(),
             ui: self.ui.clone(),
             puuid: puuid.to_owned(),
             region: region.to_owned(),
             need_name: !self.named.contains(puuid),
+            need_cheap: !cheap_fresh,
+            initial_depth: depth,
         };
         self.tasks.spawn(job.run());
     }
 
     fn lookup(&mut self, query: String) {
         let parsed = query.rsplit_once('#').map(|(n, t)| (n.trim().to_owned(), t.trim().to_owned()));
+        self.lookup_query = Some(query.clone());
+        self.lookup_target = None;
         let Some((name, tag)) = parsed.filter(|(n, t)| !n.is_empty() && !t.is_empty()) else {
             return self.ui.send(Event::LookupFailed { query, reason: "Use the format Name#Tag".into() });
         };
@@ -394,6 +451,10 @@ impl Worker {
                 let assets = Arc::new(assets);
                 self.ui.send(Event::Assets(assets.clone()));
                 self.assets = Some(assets);
+                if depth_from_u8(self.depth.load(Ordering::Relaxed)) == Depth::Act {
+                    self.fetched.clear();
+                    self.schedule_roster();
+                }
                 for key in std::mem::take(&mut self.icons_waiting) {
                     self.load_icon(key);
                 }
@@ -453,18 +514,33 @@ impl Worker {
 struct PlayerJob {
     session: Option<Arc<RiotSession>>,
     henrik: Arc<Henrik>,
-    win_model: Arc<std::sync::Mutex<WinModel>>,
+    win_model: Arc<Mutex<WinModel>>,
+    cache: Arc<Mutex<MatchCache>>,
     /// Map callouts for site-entry detection; entries are skipped until assets load.
     assets: Option<Arc<Assets>>,
     ui: UiSink,
     puuid: String,
     region: String,
     need_name: bool,
+    need_cheap: bool,
+    initial_depth: Depth,
+    /// Shared target; read before every page so a change applies mid-fetch.
+    depth: Arc<AtomicU8>,
+}
+
+/// Matches per depth level.
+fn depth_matches(d: Depth) -> u32 {
+    match d {
+        Depth::Last10 => 10,
+        Depth::Last20 => 20,
+        Depth::Act => ACT_MATCH_CAP,
+    }
 }
 
 impl PlayerJob {
     async fn run(self) -> TaskDone {
         let mut transient = false;
+        let mut cheap_transient = false;
 
         if self.need_name {
             match self.henrik.account_by_puuid(&self.puuid).await {
@@ -473,59 +549,275 @@ impl PlayerJob {
             }
         }
 
-        // Riot PD is free and fast; HenrikDev only if it fails (e.g. format change after a patch).
-        let pd = match &self.session {
-            Some(s) => s.rank(&self.puuid).await,
-            None => Err(Error::Missing("Riot session")),
-        };
-        let rank = match pd {
-            Ok(rank) => Ok(rank),
-            Err(_) => self.henrik.rank(&self.region, &self.puuid).await,
-        };
-        transient |= rank.as_ref().is_err_and(Error::is_transient);
-        self.ui.send(Event::Rank { puuid: self.puuid.clone(), rank: Fetch::from(rank) });
-
-        let stats = self.henrik.stats(&self.region, &self.puuid).await;
-        transient |= stats.as_ref().is_err_and(Error::is_transient);
-        self.ui.send(Event::Stats { puuid: self.puuid.clone(), stats: Fetch::from(stats) });
-
-        // Two pages of 5: a first rating as soon as the newest five arrive, refined by the next five.
-        // Teammates are scheduled during agent select and enemies once the match loads, so this
-        // naturally fetches teammates first.
-        let mut matches = Vec::new();
-        for start in [0, IMPACT_PAGE] {
-            let page = match self.henrik.recent_matches(&self.region, &self.puuid, start).await {
-                Ok(page) => page,
-                // Keep the first page's rating if the second page fails.
-                Err(e) if matches.is_empty() => {
-                    transient |= e.is_transient();
-                    self.ui.send(Event::Impact { puuid: self.puuid.clone(), impact: Fetch::from(Err(e)) });
-                    break;
-                }
-                Err(_) => break,
+        if self.need_cheap {
+            // Riot PD is free and fast; HenrikDev only if it fails (e.g. format change after a patch).
+            let pd = match &self.session {
+                Some(s) => s.rank(&self.puuid).await,
+                None => Err(Error::Missing("Riot session")),
             };
-            let last = start == IMPACT_PAGE || page.len() < IMPACT_PAGE as usize;
-            matches.extend(page);
-            let impact = {
-                let mut model = self.win_model.lock().unwrap_or_else(|e| e.into_inner());
-                model.ingest(&matches);
-                let impact = impact::evaluate(&matches, &self.puuid, &model, self.assets.as_deref());
-                if last && let Some(i) = &impact {
-                    model.record_spread(i.wpa_per_round as f64);
-                }
-                // Persistence is best effort: a failed write only loses what this session learned.
-                let _ = model.save();
-                impact
+            let rank = match pd {
+                Ok(rank) => Ok(rank),
+                Err(_) => self.henrik.rank(&self.region, &self.puuid).await,
             };
-            self.ui.send(Event::Impact {
-                puuid: self.puuid.clone(),
-                impact: Fetch::from(impact.ok_or(Error::NotFound)),
-            });
-            if last {
-                break;
-            }
+            cheap_transient |= rank.as_ref().is_err_and(Error::is_transient);
+            self.ui.send(Event::Rank { puuid: self.puuid.clone(), rank: Fetch::from(rank) });
+
+            let stats = self.henrik.stats(&self.region, &self.puuid).await;
+            cheap_transient |= stats.as_ref().is_err_and(Error::is_transient);
+            self.ui.send(Event::Stats { puuid: self.puuid.clone(), stats: Fetch::from(stats) });
         }
 
-        TaskDone::Player { puuid: self.puuid, ok: !transient }
+        transient |= self.deep_stats().await;
+        TaskDone::Player {
+            puuid: self.puuid,
+            ok: !transient && !cheap_transient,
+            cheap_ok: self.need_cheap && !cheap_transient,
+            depth: self.initial_depth,
+            had_assets: self.assets.is_some(),
+        }
+    }
+
+    /// Full-match history, newest first. Only a prefix the newest API page confirms is reused:
+    /// incidental matches cached from lobby-mates may leave gaps. A rating is published after
+    /// every page so the user sees something within seconds while the deeper scope loads.
+    async fn deep_stats(&self) -> bool {
+        let act = match &self.session {
+            Some(s) => s.current_act().await.ok(),
+            None => None,
+        }
+        .or_else(|| self.assets.as_ref().and_then(|a| a.latest_act().map(str::to_owned)));
+        let target0 = depth_from_u8(self.depth.load(Ordering::Relaxed));
+        if target0 == Depth::Act && act.is_none() {
+            self.unavailable(Depth::Act, "Current act unavailable");
+            return false;
+        }
+
+        let (mut matches, mut exhausted) = self.cache.lock().prefix(&self.puuid);
+        // The API's newest page is the only authority on what the latest matches are.
+        let mut page = match self.fetch_page(0, target0).await {
+            Page::Ok(page) => page,
+            Page::Failed { transient, reason } => {
+                if matches.is_empty() {
+                    self.unavailable(target0, &reason);
+                } else {
+                    // Unverified cached prefix: show it, capped at the depth it covers.
+                    let depth = staged_depth(matches.len() as u32, exhausted).min(target0);
+                    self.publish(&matches, depth, &act, false, exhausted);
+                }
+                return transient;
+            }
+        };
+        {
+            let mut cache = self.cache.lock();
+            if prefix_matches(&matches, &page) {
+                exhausted |= (page.len() as u32) < IMPACT_PAGE;
+            } else {
+                let short = (page.len() as u32) < IMPACT_PAGE;
+                matches = cache.insert(page);
+                exhausted = short;
+            }
+            cache.set_prefix(&self.puuid, &matches, exhausted);
+        }
+        if matches.is_empty() {
+            self.unavailable(target0, "No competitive matches");
+            return false;
+        }
+        let mut start = matches.len() as u32;
+        loop {
+            let target = depth_from_u8(self.depth.load(Ordering::Relaxed));
+            if target == Depth::Act && act.is_none() {
+                self.unavailable(Depth::Act, "Current act unavailable");
+                return false;
+            }
+            let have = matches.len() as u32;
+            let act_done = act.as_deref().is_some_and(|a| {
+                matches.last().is_some_and(|m| m.act().as_deref().is_some_and(|b| b != a))
+            });
+            let history_complete = exhausted || act_done;
+            let done = history_complete || have >= depth_matches(target);
+            let depth = if done { target } else { staged_depth(have, history_complete).min(target) };
+            self.publish(&matches, depth, &act, done, history_complete);
+            if done {
+                return false;
+            }
+            page = match self.fetch_page(start, target).await {
+                Page::Ok(page) => page,
+                Page::Failed { transient, .. } => return transient,
+            };
+            let page_len = page.len() as u32;
+            {
+                let mut cache = self.cache.lock();
+                matches.extend(cache.insert(page));
+                exhausted = page_len < IMPACT_PAGE;
+                start += page_len;
+                cache.set_prefix(&self.puuid, &matches, exhausted);
+            }
+        }
+    }
+
+    /// One page toward `target`, waiting out the rate-limit window so cheap calls (names,
+    /// ranks, lookups) keep their share of the HenrikDev budget.
+    async fn fetch_page(&self, start: u32, target: Depth) -> Page {
+        loop {
+            let wait = self.henrik.deep_wait_secs();
+            if wait > 0 {
+                self.ui.send(Event::ImpactProgress {
+                    puuid: self.puuid.clone(),
+                    progress: Progress::RateLimited { have: start, target, resume_secs: wait },
+                });
+                tokio::time::sleep(Duration::from_secs(wait.into())).await;
+                continue;
+            }
+            self.ui.send(Event::ImpactProgress {
+                puuid: self.puuid.clone(),
+                progress: Progress::Fetching { have: start, target },
+            });
+            return match self.henrik.recent_matches(&self.region, &self.puuid, start).await {
+                Ok(page) => {
+                    self.report_quota();
+                    Page::Ok(page)
+                }
+                Err(e) => Page::Failed { transient: e.is_transient(), reason: e.to_string() },
+            };
+        }
+    }
+
+    fn unavailable(&self, depth: Depth, reason: &str) {
+        self.ui.send(Event::Impact {
+            puuid: self.puuid.clone(),
+            depth,
+            impact: Fetch::Unavailable(reason.to_owned()),
+        });
+        self.ui.send(Event::ImpactProgress { puuid: self.puuid.clone(), progress: Progress::Done });
+    }
+
+
+    /// Rates the player over `matches` (trimmed to `depth`), updates the model, and publishes.
+    /// `complete` marks that nothing older is known to exist for this player.
+    fn publish(&self, matches: &[Arc<MatchDto>], depth: Depth, act: &Option<String>, done: bool, complete: bool) {
+        let scope: Vec<Arc<MatchDto>> = match depth {
+            Depth::Act => matches
+                .iter()
+                .filter(|m| act.as_deref().is_some_and(|a| m.act().as_deref() == Some(a)))
+                .cloned()
+                .collect(),
+            d => matches.iter().take(depth_matches(d) as usize).cloned().collect(),
+        };
+        let impact = {
+            let mut model = self.win_model.lock();
+            if model.ingest(matches) {
+                let _ = model.save();
+            }
+            impact::evaluate(&scope, &self.puuid, &model, self.assets.as_deref()).map(|mut i| {
+                i.history_complete = complete;
+                i
+            })
+        };
+        self.ui.send(Event::Impact {
+            puuid: self.puuid.clone(),
+            depth,
+            impact: Fetch::from(impact.ok_or(Error::NotFound)),
+        });
+        if done {
+            self.ui.send(Event::ImpactProgress { puuid: self.puuid.clone(), progress: Progress::Done });
+        }
+    }
+
+    fn report_quota(&self) {
+        if let Some(q) = self.henrik.quota() {
+            self.ui.send(Event::Quota { remaining: q.remaining, reset_secs: q.reset_secs });
+        }
+    }
+}
+
+enum Page {
+    Ok(Vec<MatchDto>),
+    Failed { transient: bool, reason: String },
+}
+
+/// The deepest level the fetched matches can support right now; a complete history means the
+/// act view has everything there is, however few matches that is.
+fn staged_depth(have: u32, history_complete: bool) -> Depth {
+    if history_complete {
+        Depth::Act
+    } else if have >= 20 {
+        Depth::Last20
+    } else {
+        Depth::Last10
+    }
+}
+
+/// Whether the API's newest page continues the cache's claimed prefix; only then is the prefix
+/// trusted to be contiguous with Riot's history.
+fn prefix_matches(matches: &[Arc<MatchDto>], page: &[MatchDto]) -> bool {
+    !page.is_empty()
+        && matches.len() >= page.len()
+        && matches.iter().zip(page).all(|(old, new)| old.id() == new.id())
+}
+
+fn depth_from_u8(v: u8) -> Depth {
+    match v {
+        0 => Depth::Last10,
+        1 => Depth::Last20,
+        _ => Depth::Act,
+    }
+}
+
+fn depth_to_u8(d: Depth) -> u8 {
+    match d {
+        Depth::Last10 => 0,
+        Depth::Last20 => 1,
+        Depth::Act => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dto(id: &str) -> MatchDto {
+        serde_json::from_str(&format!(r#"{{"metadata":{{"match_id":"{id}"}},"players":[]}}"#)).unwrap()
+    }
+
+    #[test]
+    fn staging_grows_with_fetched_matches_and_completes_the_history() {
+        assert_eq!(staged_depth(0, false), Depth::Last10);
+        assert_eq!(staged_depth(19, false), Depth::Last10);
+        assert_eq!(staged_depth(20, false), Depth::Last20);
+        // Exhausted or past the act boundary: everything there is, even one match.
+        assert_eq!(staged_depth(1, true), Depth::Act);
+        assert_eq!(staged_depth(3, true).max(Depth::Last10), Depth::Act);
+    }
+
+    #[test]
+    fn a_cached_prefix_must_agree_with_the_newest_page() {
+        let page = vec![dto("a"), dto("b")];
+        let same: Vec<Arc<MatchDto>> = page.iter().map(|m| Arc::new(dto(m.id()))).collect();
+        assert!(prefix_matches(&same, &page));
+        // A page that disagrees about what the newest matches are breaks the chain.
+        let reordered: Vec<Arc<MatchDto>> = page.iter().rev().map(|m| Arc::new(dto(m.id()))).collect();
+        assert!(!prefix_matches(&reordered, &page));
+        assert!(!prefix_matches(&[], &page), "an empty cache never confirms anything");
+        assert!(!prefix_matches(&same, &[]), "an empty page proves nothing");
+    }
+
+    #[test]
+    fn a_longer_confirmed_prefix_is_kept() {
+        // Newest-first: the page must agree on the newest entries; older cached ones it has
+        // not reached yet were confirmed by an earlier session and stay.
+        let page = vec![dto("c"), dto("b")];
+        let prefix: Vec<Arc<MatchDto>> =
+            ["c", "b", "a"].iter().map(|id| Arc::new(dto(id))).collect();
+        assert!(prefix_matches(&prefix, &page));
+        let wrong: Vec<Arc<MatchDto>> =
+            ["b", "c", "a"].iter().map(|id| Arc::new(dto(id))).collect();
+        assert!(!prefix_matches(&wrong, &page));
+    }
+
+    #[test]
+    fn depth_round_trips_through_the_shared_atomic() {
+        for d in [Depth::Last10, Depth::Last20, Depth::Act] {
+            assert_eq!(depth_from_u8(depth_to_u8(d)), d);
+        }
     }
 }

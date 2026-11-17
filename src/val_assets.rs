@@ -276,6 +276,11 @@ impl Assets {
         self.agents.get(uuid).and_then(|a| a.role.as_deref())
     }
 
+    /// The most recently started act: a fallback for the current act when no Riot session exists.
+    pub fn latest_act(&self) -> Option<&str> {
+        self.acts.iter().max_by(|a, b| a.1.start.cmp(&b.1.start)).map(|(id, _)| id.as_str())
+    }
+
     pub fn icon_url(&self, key: &IconKey) -> Option<&str> {
         match key {
             IconKey::Agent(uuid) => self.agents.get(uuid).map(|a| a.icon.as_str()),
