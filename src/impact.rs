@@ -11,17 +11,18 @@
 //!   A death traded within 3 s gets 40% of its loss back from the trader.
 //! * plant: planter gains the swing, alive defenders share the loss.
 //! * defuse: defuser gains what the attackers had left, alive attackers share the loss.
-//! * round end: whatever the events didn't explain goes to survivors.
+//! * unobserved events (time expiring, unseen utility) earn no invented individual credit.
 //!
 //! Swings that went to the side that ended up losing the round count half. Time-awareness makes
-//! kills in decided rounds (no time to plant or defuse) worth little on its own. Every round nets
-//! to zero between the teams.
+//! kills in decided rounds (no time to plant or defuse) worth little on their own. Every
+//! observed event nets to zero between the teams.
 //!
 //! The model learns from every match fetched (persisted to `winmodel-v2.json`), shrinking sparse
 //! states toward coarser estimates and finally toward simple alive-count odds.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -54,21 +55,25 @@ const NEAR_UNITS: f32 = 1_500.0;
 const LURK_UNITS: f32 = 3_000.0;
 /// Matches shown in the round strip.
 const STRIP_MATCHES: usize = 2;
-/// Pseudo-rounds of zero impact added to every sample, so a few lucky rounds don't dominate.
-const SHRINK_ROUNDS: f64 = 40.0;
+/// Minimum pseudo-rounds of zero impact mixed into every sample; the real amount grows with the
+/// player's measured round-to-round noise (see `evaluate`).
+const SHRINK_ROUNDS_MIN: f64 = 20.0;
+/// Per-round WPA variance assumed for the population of players (sd ≈ 0.03 per round).
+const PLAYER_VARIANCE: f64 = 0.03 * 0.03;
 /// Pseudo-observations pulling sparse states toward their parent estimate.
 const CELL_PRIOR: f64 = 8.0;
 /// Match ids remembered to avoid counting a shared match twice.
 const SEEN_CAP: usize = 5_000;
-/// Rating scale: before data accumulates, assume players' WPA/round spreads with this SD.
+/// A fixed scale keeps the same WPA/round comparable across sessions and fetch depths.
 const SPREAD_PRIOR_SD: f64 = 0.03;
-const SPREAD_PRIOR_N: f64 = 20.0;
 /// Rating points per standard deviation of WPA/round.
 const RATING_PER_SD: f64 = 0.15;
 
 // ---- HenrikDev v4 match: only the fields the rating needs ----------------------------------
+//
+// Serialized as-is into the on-disk match cache, so field names here are the cache format.
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct MatchDto {
     metadata: MetaDto,
     #[serde(default)]
@@ -79,29 +84,67 @@ pub struct MatchDto {
     kills: Vec<KillDto>,
 }
 
-#[derive(Deserialize)]
+impl MatchDto {
+    pub fn id(&self) -> &str {
+        &self.metadata.match_id
+    }
+
+    /// Lowercase act UUID the match was played in.
+    pub fn act(&self) -> Option<String> {
+        self.metadata.season.as_ref().map(|s| s.id.to_ascii_lowercase())
+    }
+
+    /// RFC 3339 start time; sorts chronologically as a string.
+    pub fn started_at(&self) -> &str {
+        self.metadata.started_at.as_deref().unwrap_or_default()
+    }
+
+    /// Team id of a player in this match ("Red"/"Blue"), from any round they appear in.
+    fn team_of(&self, puuid: &str) -> Option<&str> {
+        self.rounds.iter().flat_map(|r| &r.stats).find(|s| s.player.puuid == puuid).map(|s| s.player.team.as_str())
+    }
+
+    pub fn player_ids(&self) -> Vec<String> {
+        self.players.iter().map(|p| p.puuid.clone()).collect()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct MetaDto {
     match_id: String,
     #[serde(default)]
     map: Option<IdDto>,
+    #[serde(default)]
+    season: Option<IdDto>,
+    #[serde(default)]
+    started_at: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct IdDto {
     id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct MatchPlayerDto {
     puuid: String,
     #[serde(default)]
     agent: Option<IdDto>,
     #[serde(default)]
     ability_casts: CastsDto,
+    /// Competitive tier at the time of the match (`tier.id`).
+    #[serde(default)]
+    tier: Option<TierDto>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct TierDto {
+    #[serde(default)]
+    id: u32,
 }
 
 /// Whole-match totals; per-round counts are not populated by the API.
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct CastsDto {
     grenade: Option<u32>,
@@ -116,7 +159,7 @@ impl CastsDto {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct RoundDto {
     winning_team: Option<String>,
     /// "Attacker" / "Defender".
@@ -127,7 +170,7 @@ struct RoundDto {
     stats: Vec<RoundStatDto>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct SpikeDto {
     /// Milliseconds since the combat phase began (the buy phase is excluded).
     round_time_in_ms: u64,
@@ -136,7 +179,7 @@ struct SpikeDto {
     player_locations: Vec<LocatedDto>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct RoundStatDto {
     player: PlayerRef,
     #[serde(default)]
@@ -148,20 +191,20 @@ struct RoundStatDto {
     damage_events: Vec<DamageDto>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 struct EconomyDto {
     #[serde(default)]
     loadout_value: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct DamageDto {
     player: PlayerRef,
     #[serde(default)]
     damage: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct KillDto {
     /// 0-based index into `rounds`.
     round: usize,
@@ -180,26 +223,26 @@ struct KillDto {
     player_locations: Vec<LocatedDto>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct WeaponDto {
     /// "Weapon" or "Ability".
     #[serde(rename = "type")]
     kind: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct LocatedDto {
     player: PlayerRef,
     location: PointDto,
 }
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 struct PointDto {
     x: f32,
     y: f32,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PlayerRef {
     puuid: String,
     #[serde(default)]
@@ -406,9 +449,6 @@ pub struct WinModel {
     cells: HashMap<State, [u32; 2]>,
     seen: VecDeque<String>,
     seen_set: HashSet<String>,
-    /// Count and sum of squares of per-player WPA/round, for the rating scale.
-    spread_n: f64,
-    spread_ss: f64,
     /// Agent UUID → [ability casts, rounds played].
     agent_util: HashMap<String, [f64; 2]>,
 }
@@ -417,8 +457,6 @@ pub struct WinModel {
 struct Stored {
     cells: Vec<(State, [u32; 2])>,
     seen: Vec<String>,
-    spread_n: f64,
-    spread_ss: f64,
     agent_util: Vec<(String, [f64; 2])>,
 }
 
@@ -455,8 +493,6 @@ impl WinModel {
             cells: stored.cells.into_iter().collect(),
             seen_set: stored.seen.iter().cloned().collect(),
             seen: stored.seen.into(),
-            spread_n: stored.spread_n,
-            spread_ss: stored.spread_ss,
             agent_util: stored.agent_util.into_iter().collect(),
         }
     }
@@ -469,37 +505,43 @@ impl WinModel {
         let stored = Stored {
             cells: self.cells.iter().map(|(k, v)| (*k, *v)).collect(),
             seen: self.seen.iter().cloned().collect(),
-            spread_n: self.spread_n,
-            spread_ss: self.spread_ss,
             agent_util: self.agent_util.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         };
         std::fs::write(path, serde_json::to_vec(&stored)?)
     }
 
-    fn count(&self, s: State) -> (f64, f64) {
-        self.cells.get(&s).map_or((0.0, 0.0), |[n, w]| (*n as f64, *w as f64))
+    fn count(&self, s: State, exclude: Option<&HashMap<State, [u32; 2]>>) -> (f64, f64) {
+        let [n, w] = self.cells.get(&s).copied().unwrap_or_default();
+        let [held_n, held_w] = exclude.and_then(|cells| cells.get(&s)).copied().unwrap_or_default();
+        (n.saturating_sub(held_n) as f64, w.saturating_sub(held_w) as f64)
     }
 
     /// Exact cell → pooled over economy → pooled over economy and time → prior.
+    #[cfg(test)]
     fn p_attack(&self, s: State) -> f64 {
+        self.p_attack_except(s, None)
+    }
+
+    fn p_attack_except(&self, s: State, exclude: Option<&HashMap<State, [u32; 2]>>) -> f64 {
         if let Some(p) = s.decided() {
             return p;
         }
         let shrink = |(n, w): (f64, f64), parent: f64| (w + CELL_PRIOR * parent) / (n + CELL_PRIOR);
         let sum = |states: &mut dyn Iterator<Item = State>| {
-            states.map(|s| self.count(s)).fold((0.0, 0.0), |acc, (n, w)| (acc.0 + n, acc.1 + w))
+            states.map(|s| self.count(s, exclude)).fold((0.0, 0.0), |acc, (n, w)| (acc.0 + n, acc.1 + w))
         };
         let coarse = sum(&mut (-1..=1).flat_map(|econ| (0..4).map(move |time| State { econ, time, ..s })));
         let p = shrink(coarse, prior(s));
         let timed = sum(&mut (-1..=1).map(|econ| State { econ, ..s }));
         let p = shrink(timed, p);
-        shrink(self.count(s), p)
+        shrink(self.count(s, exclude), p)
     }
 
     /// Learns from matches not seen before. Returns whether anything was added.
-    pub fn ingest(&mut self, matches: &[MatchDto]) -> bool {
+    pub fn ingest(&mut self, matches: &[Arc<MatchDto>]) -> bool {
         let mut changed = false;
         for m in matches {
+            let m: &MatchDto = m;
             if !self.seen_set.insert(m.metadata.match_id.clone()) {
                 continue;
             }
@@ -516,21 +558,10 @@ impl WinModel {
                 entry[0] += p.ability_casts.total() as f64;
                 entry[1] += n as f64;
             }
-            for round in rounds(m) {
-                let (start, steps) = replay(&round);
-                let visited: HashSet<State> = std::iter::once(Some(start))
-                    .chain(steps.iter().flat_map(|s| match s.kind {
-                        StepKind::Defuse(_) => [Some(s.before), None],
-                        _ => [Some(s.before), Some(s.after)],
-                    }))
-                    .flatten()
-                    .filter(|s| s.decided().is_none())
-                    .collect();
-                for s in visited {
-                    let cell = self.cells.entry(s).or_insert([0, 0]);
-                    cell[0] += 1;
-                    cell[1] += round.attackers_won as u32;
-                }
+            for (s, [n, w]) in cells_for_match(m) {
+                let cell = self.cells.entry(s).or_insert([0, 0]);
+                cell[0] += n;
+                cell[1] += w;
                 changed = true;
             }
         }
@@ -539,20 +570,35 @@ impl WinModel {
 
     /// The 1.00-centred rating for a WPA/round value.
     fn rating(&self, wpa_per_round: f64) -> f64 {
-        let sd = ((self.spread_ss + SPREAD_PRIOR_N * SPREAD_PRIOR_SD.powi(2)) / (self.spread_n + SPREAD_PRIOR_N)).sqrt();
-        1.0 + RATING_PER_SD * wpa_per_round / sd
-    }
-
-    /// Adds a player's final WPA/round to the spread that scales ratings.
-    pub fn record_spread(&mut self, wpa_per_round: f64) {
-        self.spread_n += 1.0;
-        self.spread_ss += wpa_per_round * wpa_per_round;
+        1.0 + RATING_PER_SD * wpa_per_round / SPREAD_PRIOR_SD
     }
 
     fn agent_casts_per_round(&self, agent: &str) -> Option<f32> {
         let [casts, rounds] = self.agent_util.get(agent)?;
         (*rounds > 0.0).then(|| (casts / rounds) as f32)
     }
+}
+
+/// Each state counts once per round, even if several events revisit it.
+fn cells_for_match(m: &MatchDto) -> HashMap<State, [u32; 2]> {
+    let mut cells: HashMap<State, [u32; 2]> = HashMap::new();
+    for round in rounds(m) {
+        let (start, steps) = replay(&round);
+        let visited: HashSet<State> = std::iter::once(Some(start))
+            .chain(steps.iter().flat_map(|s| match s.kind {
+                StepKind::Defuse(_) => [Some(s.before), None],
+                _ => [Some(s.before), Some(s.after)],
+            }))
+            .flatten()
+            .filter(|s| s.decided().is_none())
+            .collect();
+        for s in visited {
+            let cell = cells.entry(s).or_default();
+            cell[0] += 1;
+            cell[1] += round.attackers_won as u32;
+        }
+    }
+    cells
 }
 
 /// Rounds each player was present and not AFK.
@@ -617,8 +663,8 @@ fn or_lineup<'s, 'a>(alive: &'s [&'a str], lineup: &'s [&'a str]) -> &'s [&'a st
     if alive.is_empty() { lineup } else { alive }
 }
 
-fn credit_round<'a>(r: &RoundCtx<'a>, model: &WinModel) -> RoundCredit<'a> {
-    let (start, steps) = replay(r);
+fn credit_round<'a>(r: &RoundCtx<'a>, model: &WinModel, exclude: Option<&HashMap<State, [u32; 2]>>) -> RoundCredit<'a> {
+    let (_, steps) = replay(r);
     let weight = |gaining_side_attacks: bool| {
         if gaining_side_attacks == r.attackers_won { 1.0 } else { LOST_ROUND_WEIGHT }
     };
@@ -631,13 +677,12 @@ fn credit_round<'a>(r: &RoundCtx<'a>, model: &WinModel) -> RoundCredit<'a> {
         defuser: None,
     };
     let (mut alive_att, mut alive_def) = (r.start_att.clone(), r.start_def.clone());
-    let mut p_last = model.p_attack(start);
 
     for step in steps {
-        let p_before = model.p_attack(step.before);
+        let p_before = model.p_attack_except(step.before, exclude);
         let p_after = match step.kind {
             StepKind::Defuse(_) => 0.0,
-            _ => model.p_attack(step.after),
+            _ => model.p_attack_except(step.after, exclude),
         };
         let swing = p_after - p_before; // attackers' perspective
         match &step.kind {
@@ -670,7 +715,6 @@ fn credit_round<'a>(r: &RoundCtx<'a>, model: &WinModel) -> RoundCredit<'a> {
             }
             StepKind::Revive => {}
         }
-        p_last = p_after;
         alive_att = step.alive_att;
         alive_def = step.alive_def;
         for (mine, theirs) in [(&alive_att, &alive_def), (&alive_def, &alive_att)] {
@@ -680,11 +724,8 @@ fn credit_round<'a>(r: &RoundCtx<'a>, model: &WinModel) -> RoundCredit<'a> {
         }
     }
 
-    // Whatever the events didn't explain (detonation, time, the clock running down) goes to the
-    // living; a wiped side's share goes to its whole lineup so the round still nets to zero.
-    let residual = if r.attackers_won { 1.0 } else { 0.0 } - p_last;
-    split(&mut c.wpa, or_lineup(&alive_att, &r.start_att), residual);
-    split(&mut c.wpa, or_lineup(&alive_def, &r.start_def), -residual);
+    // Clock expiry and unobserved utility cannot be assigned to an individual from this API.
+    // No residual credit: merely surviving while a stronger teammate wins is not impact.
     c.survivors = alive_att.into_iter().chain(alive_def).collect();
     c
 }
@@ -784,6 +825,8 @@ fn isolated(me: &str, positions: &[(&str, (f32, f32))], side: &HashMap<&str, boo
 struct Tally {
     impact: Impact,
     wpa: f64,
+    attack_wpa: f64,
+    defence_wpa: f64,
     kast_rounds: u32,
     lurk_swing_sum: f64,
     casts: u32,
@@ -792,33 +835,63 @@ struct Tally {
     entry_spots: HashMap<String, u32>,
 }
 
-/// Impact for `puuid` across `matches` (newest first). `assets` enables site-entry detection.
-/// `None` when the player has no playable rounds in the sample.
-pub fn evaluate(matches: &[MatchDto], puuid: &str, model: &WinModel, assets: Option<&Assets>) -> Option<Impact> {
+/// Impact for `puuid` across `matches` (newest first). `assets` enables site-entry detection
+/// and tier normalization. `None` when the player has no playable rounds in the sample.
+pub fn evaluate(matches: &[Arc<MatchDto>], puuid: &str, model: &WinModel, assets: Option<&Assets>) -> Option<Impact> {
     let mut t = Tally::default();
     let mut strip: Vec<Vec<RoundSwing>> = Vec::new();
+    let mut per_match: Vec<(f64, u32)> = Vec::new();
+    let mut round_swings: Vec<f64> = Vec::new();
+    let (mut opp_tier_sum, mut opp_tier_n, mut own_tier_sum, mut own_tier_n) = (0.0, 0u32, 0.0, 0u32);
 
     for (mi, m) in matches.iter().enumerate() {
         let played = rounds_played(m);
         let Some(&my_rounds) = played.get(puuid) else { continue };
         t.impact.matches += 1;
-        if let Some(p) = m.players.iter().find(|p| p.puuid == puuid) {
+        let me = m.players.iter().find(|p| p.puuid == puuid);
+        if let Some(p) = me {
             t.casts += p.ability_casts.total();
             t.cast_rounds += my_rounds;
             if let Some(agent) = &p.agent {
                 *t.agents.entry(agent.id.to_ascii_lowercase()).or_default() += 1;
             }
         }
+        // Lobby strength: opponents' tiers (normalized to the current table when the act is known).
+        let normalize = |tier: u32| match (assets, m.act()) {
+            (Some(a), Some(act)) => a.normalize_tier(&act, tier),
+            _ => tier,
+        };
+        let my_team = me.and_then(|p| m.team_of(&p.puuid));
+        for p in &m.players {
+            let Some(tier) = p.tier.as_ref().map(|t| t.id).filter(|t| *t > 0) else { continue };
+            let tier = normalize(tier) as f64;
+            if p.puuid == puuid {
+                own_tier_sum += tier;
+                own_tier_n += 1;
+            } else if m.team_of(&p.puuid) != my_team {
+                opp_tier_sum += tier;
+                opp_tier_n += 1;
+            }
+        }
         let map = m.metadata.map.as_ref().map(|m| m.id.to_ascii_lowercase());
         let mut match_strip = Vec::new();
+        let wpa_before = t.wpa;
+        let rounds_before = t.impact.rounds;
+        // Never score a match using its own outcome in the learned win probabilities.
+        let held = model.seen_set.contains(m.id()).then(|| cells_for_match(m));
         for r in rounds(m) {
             if !r.start_att.contains(&puuid) && !r.start_def.contains(&puuid) {
                 continue; // absent or AFK this round
             }
-            let swing = evaluate_round(&r, puuid, model, assets, map.as_deref(), &mut t);
+            let swing = evaluate_round(&r, puuid, model, held.as_ref(), assets, map.as_deref(), &mut t);
+            round_swings.push(swing.swing as f64);
             if mi < STRIP_MATCHES {
                 match_strip.push(swing);
             }
+        }
+        let n = t.impact.rounds - rounds_before;
+        if n > 0 {
+            per_match.push((t.wpa - wpa_before, n));
         }
         if let Some(first) = match_strip.first_mut() {
             first.match_start = true;
@@ -830,9 +903,32 @@ pub fn evaluate(matches: &[MatchDto], puuid: &str, model: &WinModel, assets: Opt
     }
 
     let mut out = t.impact;
-    let shrunk = t.wpa / (out.rounds as f64 + SHRINK_ROUNDS);
+    let n = out.rounds as f64;
+    // Empirical Bayes: the sample mean is shrunk by its own noise. A player whose rounds swing
+    // wildly needs more rounds before the rating trusts them.
+    let mean = t.wpa / n;
+    let round_var = round_swings.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
+    let shrink_rounds = (round_var / PLAYER_VARIANCE).max(SHRINK_ROUNDS_MIN);
+    let reliability = n / (n + shrink_rounds);
+    let shrunk = mean * reliability;
     out.wpa_per_round = shrunk as f32;
+    out.reliability = reliability as f32;
     out.rating = model.rating(shrunk) as f32;
+    let match_means: Vec<f64> = per_match.iter().map(|(w, n)| w / *n as f64).collect();
+    let mm = match_means.iter().sum::<f64>() / match_means.len() as f64;
+    out.consistency_sd = if match_means.len() > 1 {
+        (match_means.iter().map(|x| (x - mm).powi(2)).sum::<f64>() / (match_means.len() - 1) as f64).sqrt() as f32
+    } else {
+        0.0
+    };
+    out.opponent_tier = if opp_tier_n > 0 { (opp_tier_sum / opp_tier_n as f64) as f32 } else { 0.0 };
+    out.tier_gap = if opp_tier_n > 0 && own_tier_n > 0 {
+        (own_tier_sum / own_tier_n as f64 - opp_tier_sum / opp_tier_n as f64) as f32
+    } else {
+        0.0
+    };
+    out.attack_wpa = if out.attack_rounds > 0 { (t.attack_wpa / out.attack_rounds as f64) as f32 } else { 0.0 };
+    out.defence_wpa = if out.defence_rounds > 0 { (t.defence_wpa / out.defence_rounds as f64) as f32 } else { 0.0 };
     out.kast = t.kast_rounds as f32 / out.rounds as f32;
     out.casts_per_round = t.casts as f32 / t.cast_rounds.max(1) as f32;
     out.main_agent = t.agents.into_iter().max_by_key(|(_, n)| *n).map(|(a, _)| a);
@@ -843,22 +939,29 @@ pub fn evaluate(matches: &[MatchDto], puuid: &str, model: &WinModel, assets: Opt
     out.recent_rounds = strip.into_iter().take(STRIP_MATCHES).rev().flatten().collect();
     Some(out)
 }
-
 fn evaluate_round(
     r: &RoundCtx<'_>,
     me: &str,
     model: &WinModel,
+    exclude: Option<&HashMap<State, [u32; 2]>>,
     assets: Option<&Assets>,
     map: Option<&str>,
     t: &mut Tally,
 ) -> RoundSwing {
-    let c = credit_round(r, model);
+    let c = credit_round(r, model, exclude);
     let attacker = r.side[me];
     let my_swing = c.wpa.get(me).copied().unwrap_or(0.0);
     let plant_t = r.plant.map(|p| p.round_time_in_ms);
     let out = &mut t.impact;
     out.rounds += 1;
     t.wpa += my_swing;
+    if attacker {
+        out.attack_rounds += 1;
+        t.attack_wpa += my_swing;
+    } else {
+        out.defence_rounds += 1;
+        t.defence_wpa += my_swing;
+    }
 
     let mut kast = c.survivors.contains(&me);
     let mut lurked = false;
@@ -970,6 +1073,48 @@ fn evaluate_round(
         defused: c.defuser == Some(me),
         match_start: false,
     }
+}
+
+
+/// Brier score of the learned model vs. the alive-count prior, leave-one-match-out.
+#[cfg(test)]
+pub fn debug_calibration(matches: &[Arc<MatchDto>], _full: &WinModel) -> String {
+    let (mut n, mut brier_model, mut brier_prior, mut brier_half) = (0u32, 0.0, 0.0, 0.0);
+    for (i, held) in matches.iter().enumerate() {
+        let mut train = WinModel::default();
+        let others: Vec<Arc<MatchDto>> = matches.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, m)| m.clone()).collect();
+        train.ingest(&others);
+        for r in rounds(held) {
+            let (start, steps) = replay(&r);
+            let y = r.attackers_won as u8 as f64;
+            for s in std::iter::once(start).chain(steps.iter().map(|s| s.after)).filter(|s| s.decided().is_none()) {
+                n += 1;
+                brier_model += (train.p_attack(s) - y).powi(2);
+                brier_prior += (prior(s) - y).powi(2);
+                brier_half += (0.5 - y).powi(2);
+            }
+        }
+    }
+    let n = n.max(1) as f64;
+    format!(
+        "calibration over {n} undecided states (leave-one-match-out): Brier model {:.4} · prior {:.4} · coin {:.4}",
+        brier_model / n,
+        brier_prior / n,
+        brier_half / n
+    )
+}
+
+#[cfg(test)]
+pub fn debug_players(matches: &[Arc<MatchDto>]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for m in matches {
+        for p in &m.players {
+            if !seen.contains(&p.puuid) {
+                seen.push(p.puuid.clone());
+            }
+        }
+    }
+    seen
 }
 
 #[cfg(test)]
@@ -1100,14 +1245,14 @@ mod tests {
         let m = sample();
         let model = WinModel::default();
         for r in rounds(&m) {
-            let total: f64 = credit_round(&r, &model).wpa.values().sum();
+            let total: f64 = credit_round(&r, &model, None).wpa.values().sum();
             assert!(total.abs() < 1e-9, "round credit must net to zero, got {total}");
         }
     }
 
     #[test]
     fn credits_openings_trades_clutches_and_utility() {
-        let m = sample();
+        let m = Arc::new(sample());
         let model = WinModel::default();
         let a2 = evaluate(std::slice::from_ref(&m), "a2", &model, None).unwrap();
         assert_eq!((a2.rounds, a2.kills, a2.trades_fast, a2.trades_late), (2, 3, 1, 0));
@@ -1131,7 +1276,7 @@ mod tests {
         let m = sample();
         let model = WinModel::default();
         let r = &rounds(&m)[0];
-        let c = credit_round(r, &model);
+        let c = credit_round(r, &model, None);
         let d2_kill = c.kills.iter().find(|k| k.victim() == "a1").unwrap();
         assert_eq!(d2_kill.util_assists, vec!["d3"]);
 
@@ -1142,7 +1287,7 @@ mod tests {
             &[("Blue", "Defender", None, None)],
             &[(0, "d2", "a1", 100), (0, "d4", "a1", 50)],
         );
-        let credit = |m: &MatchDto, p: &str| credit_round(&rounds(m)[0], &model).wpa.get(p).copied().unwrap_or(0.0);
+        let credit = |m: &MatchDto, p: &str| credit_round(&rounds(m)[0], &model, None).wpa.get(p).copied().unwrap_or(0.0);
         assert!(credit(&shared, "d4") > credit(&solo, "d4"), "damage share is credited");
         assert!(credit(&shared, "d2") < credit(&solo, "d2"), "the final blow is shared");
 
@@ -1167,7 +1312,7 @@ mod tests {
         // The victim is dead at round end, so their credit is exactly the weighted swing.
         let opening_loss = |winner: &str, role: &str| {
             let m = build(&[k(0, 10_000, "a1", "d1")], &[(winner, role, None, None)], &[(0, "a1", "d1", 150)]);
-            -credit_round(&rounds(&m)[0], &model).wpa["d1"]
+            -credit_round(&rounds(&m)[0], &model, None).wpa["d1"]
         };
         let attackers_won = opening_loss("Red", "Attacker");
         let attackers_lost = opening_loss("Blue", "Defender");
@@ -1181,16 +1326,16 @@ mod tests {
     fn late_post_plant_kills_are_low_impact_and_isolation_counts_as_lurk() {
         let model = WinModel::default();
         // Spike planted at 30 s; d1 kills a1 at 70 s (5 s on the spike): the round is decided.
-        let late = build(
+        let late = Arc::new(build(
             &[K { vx: 0, ..k(0, 70_000, "d1", "a1") }],
             &[("Red", "Attacker", Some(30_000), None)],
             &[],
-        );
+        ));
         let d1 = evaluate(std::slice::from_ref(&late), "d1", &model, None).unwrap();
         assert_eq!(d1.low_impact_kills, 1);
 
         // a1 kills d1 5,000 units from every teammate before any plant: a lurk kill.
-        let lurk = build(&[K { vx: 5_000, ..k(0, 20_000, "a1", "d1") }], &[("Red", "Attacker", None, None)], &[]);
+        let lurk = Arc::new(build(&[K { vx: 5_000, ..k(0, 20_000, "a1", "d1") }], &[("Red", "Attacker", None, None)], &[]));
         let a1 = evaluate(std::slice::from_ref(&lurk), "a1", &model, None).unwrap();
         assert_eq!(a1.lurk_rounds, 1);
     }
@@ -1199,18 +1344,18 @@ mod tests {
     fn missed_refrag_needs_proximity_and_no_trade() {
         let model = WinModel::default();
         // a1 dies at x = 0 next to the others; nobody trades d1 within 5 s.
-        let m = build(&[k(0, 10_000, "d1", "a1"), k(0, 30_000, "a2", "d1")], &[("Red", "Attacker", None, None)], &[]);
+        let m = Arc::new(build(&[k(0, 10_000, "d1", "a1"), k(0, 30_000, "a2", "d1")], &[("Red", "Attacker", None, None)], &[]));
         let a3 = evaluate(std::slice::from_ref(&m), "a3", &model, None).unwrap();
         assert_eq!(a3.missed_refrags, 1);
         // Same death traded after 2 s: nobody missed it.
-        let m = build(&[k(0, 10_000, "d1", "a1"), k(0, 12_000, "a2", "d1")], &[("Red", "Attacker", None, None)], &[]);
+        let m = Arc::new(build(&[k(0, 10_000, "d1", "a1"), k(0, 12_000, "a2", "d1")], &[("Red", "Attacker", None, None)], &[]));
         let a3 = evaluate(std::slice::from_ref(&m), "a3", &model, None).unwrap();
         assert_eq!(a3.missed_refrags, 0);
     }
 
     #[test]
     fn model_learns_each_match_once_and_tracks_agent_util() {
-        let m = sample();
+        let m = Arc::new(sample());
         let mut model = WinModel::default();
         let start = State { a: 5, d: 5, planted: false, econ: 0, time: 0 };
         assert!((model.p_attack(start) - 0.5).abs() < 1e-9);
@@ -1219,6 +1364,17 @@ mod tests {
         assert_eq!(model.cells[&start], [2, 1]);
         assert_eq!(model.p_attack(State { d: 0, ..start }), 1.0);
         assert_eq!(model.agent_casts_per_round("agent-a1"), Some(1.5), "3 casts over 2 rounds");
+    }
+
+    #[test]
+    fn evaluating_a_match_does_not_train_on_its_own_outcome() {
+        let m = Arc::new(sample());
+        let mut model = WinModel::default();
+        let before = evaluate(std::slice::from_ref(&m), "a2", &model, None).unwrap();
+        model.ingest(std::slice::from_ref(&m));
+        let after = evaluate(std::slice::from_ref(&m), "a2", &model, None).unwrap();
+        assert!((before.wpa_per_round - after.wpa_per_round).abs() < 1e-7);
+        assert!((before.rating - after.rating).abs() < 1e-7);
     }
 
     #[test]

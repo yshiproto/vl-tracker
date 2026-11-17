@@ -4,7 +4,7 @@
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Vec2};
 
 use crate::impact_label;
-use crate::model::{Fetch, Impact, RankProfile, RoundSwing, Stats};
+use crate::model::{Depth, Fetch, Impact, Progress, RankProfile, RoundSwing, Stats};
 use crate::{App, PlayerInfo};
 
 pub(crate) const CARD_WIDTH: f32 = 340.0;
@@ -59,7 +59,8 @@ impl App {
     /// The full card for one player. Missing data shows as a short status line per section.
     pub(crate) fn detail_card(&mut self, ui: &mut egui::Ui, puuid: &str) {
         ui.set_width(CARD_WIDTH);
-        let Some(PlayerInfo { riot_id, rank, stats, impact }) = self.players.get(puuid).cloned() else {
+        let Some(PlayerInfo { riot_id, rank, stats, impact, impact_depth, progress }) = self.players.get(puuid).cloned()
+        else {
             ui.label(RichText::new("No data for this player yet").weak());
             return;
         };
@@ -69,10 +70,10 @@ impl App {
         self.rank_section(ui, &rank);
 
         match &impact {
-            Fetch::Ready(i) => self.impact_section(ui, i),
+            Fetch::Ready(i) => self.impact_section(ui, i, impact_depth, progress.as_ref()),
             Fetch::Pending => {
                 section(ui, "IMPACT");
-                ui.label(RichText::new("Calculating from the last 10 matches…").weak());
+                ui.label(RichText::new(progress_text(progress.as_ref(), 0)).weak());
             }
             Fetch::Unavailable(reason) => {
                 section(ui, "IMPACT");
@@ -95,8 +96,9 @@ impl App {
         rows_grid(ui, "rank_rows", &rows);
     }
 
-    fn impact_section(&self, ui: &mut egui::Ui, i: &Impact) {
-        section(ui, &format!("IMPACT · LAST {} MATCHES", i.matches));
+    fn impact_section(&self, ui: &mut egui::Ui, i: &Impact, depth: Depth, progress: Option<&Progress>) {
+        let scope = format!("{} MATCHES", depth.scope(i.matches, i.history_complete).to_ascii_uppercase());
+        section(ui, &format!("IMPACT · {scope}"));
         let (label, color) = impact_label(i.rating);
         let agent = i.main_agent.as_deref();
         let assets = self.assets.as_deref();
@@ -123,12 +125,63 @@ impl App {
             .small()
             .weak(),
         );
+        if !matches!(progress, None | Some(Progress::Done)) {
+            ui.label(RichText::new(progress_text(progress, i.matches)).small().color(Color32::from_rgb(230, 170, 90)));
+        }
         if !i.recent_rounds.is_empty() {
             ui.add_space(4.0);
             round_strip(ui, &i.recent_rounds);
             ui.label(RichText::new("Round by round, last 2 matches (hover a bar)").small().weak());
         }
         ui.add_space(4.0);
+
+        // How much to trust the number, and against whom it was earned.
+        let confidence = match i.reliability {
+            r if r >= 0.75 => "high",
+            r if r >= 0.5 => "medium",
+            _ => "low",
+        };
+        let steadiness = match i.consistency_sd {
+            s if s < 0.04 => "steady",
+            s if s < 0.08 => "varies",
+            _ => "streaky",
+        };
+        let mut context = vec![
+            row(
+                "Confidence",
+                format!("{confidence} ({:.0}% own data)", i.reliability * 100.0),
+                "Share of the rating that comes from this player's rounds rather than shrinkage toward break-even. \
+                 Grows with rounds; falls when their rounds swing wildly",
+            ),
+            row(
+                "Consistency",
+                format!("{steadiness} (match-to-match ±{:.1}%)", i.consistency_sd * 100.0),
+                "Spread of per-match impact. Streaky players carry some games and sink others",
+            ),
+            row(
+                "Attack / defence",
+                format!(
+                    "{:+.1}% / {:+.1}% per round",
+                    i.attack_wpa * 100.0,
+                    i.defence_wpa * 100.0
+                ),
+                "Impact per round on each side",
+            ),
+        ];
+        if i.opponent_tier > 0.0 {
+            let gap = match i.tier_gap {
+                g if g <= -1.0 => format!(" · punching up {:.1} tiers", -g),
+                g if g >= 1.0 => format!(" · {:.1} tiers above them", g),
+                _ => String::new(),
+            };
+            context.push(row(
+                "Lobby strength",
+                format!("avg opponent {}{gap}", self.tier_label(i.opponent_tier.round() as u32)),
+                "Average competitive tier of opponents in these matches, from their rank at the time",
+            ));
+        }
+        rows_grid(ui, "context_rows", &context);
+        ui.add_space(6.0);
 
         let general = vec![
             row(
@@ -295,6 +348,25 @@ impl App {
 
     fn act_label(&self, act: &str) -> String {
         self.assets.as_ref().and_then(|a| a.acts.get(act)).map_or_else(|| "Unknown act".into(), |a| a.label.clone())
+    }
+}
+
+/// One line describing where a player's deep fetch stands.
+fn progress_text(progress: Option<&Progress>, have_now: u32) -> String {
+    match progress {
+        None => "Queued for match history…".into(),
+        Some(Progress::Done) => String::new(),
+        Some(Progress::Fetching { have, target }) => {
+            let have = (*have).max(have_now);
+            format!("Fetching match history… {have} so far, target: {}", target.label().to_lowercase())
+        }
+        Some(Progress::RateLimited { have, target, resume_secs }) => {
+            let have = (*have).max(have_now);
+            format!(
+                "Waiting {resume_secs}s for API quota ({have} so far, target: {})",
+                target.label().to_lowercase()
+            )
+        }
     }
 }
 
