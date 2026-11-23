@@ -62,7 +62,9 @@ impl Default for OverlayConfig {
             layout_version: LAYOUT_VERSION,
             // Agent-select cards are 126 px wide every 136 px from x = 620; the free strip below
             // them starts at y ≈ 1040 (the LOCK IN button covers the space above).
-            agent_select: (0..5).map(|i| at(620.0 + 136.0 * i as f32, 1040.0)).collect(),
+            agent_select: (0..5)
+                .map(|i| at(620.0 + 136.0 * i as f32, 1040.0))
+                .collect(),
             // Right of the card row, clear of LOCK IN and the "enemy team locked in" indicator.
             agent_select_card: at(1305.0, 1020.0),
             loading_ally: loading(312.0),
@@ -127,14 +129,20 @@ mod tests {
     #[test]
     fn old_saved_positions_are_replaced_but_settings_kept() {
         // Written by an earlier build when the user saved their API key.
-        let old = r#"{"henrik_api_key":"HDEV-x","overlay":{"hotkey":"F9","agent_select":[[0.16,0.22]]}}"#;
+        let old =
+            r#"{"henrik_api_key":"HDEV-x","overlay":{"hotkey":"F9","agent_select":[[0.16,0.22]]}}"#;
         let config = migrated(old);
         assert_eq!(config.henrik_api_key, "HDEV-x");
         assert_eq!(config.overlay.hotkey, "F9", "user settings survive");
-        assert_eq!(config.overlay.agent_select, OverlayConfig::default().agent_select);
+        assert_eq!(
+            config.overlay.agent_select,
+            OverlayConfig::default().agent_select
+        );
 
         // A current-version calibration is left alone.
-        let current = format!(r#"{{"overlay":{{"layout_version":{LAYOUT_VERSION},"agent_select":[[0.5,0.5]]}}}}"#);
+        let current = format!(
+            r#"{{"overlay":{{"layout_version":{LAYOUT_VERSION},"agent_select":[[0.5,0.5]]}}}}"#
+        );
         assert_eq!(migrated(&current).overlay.agent_select, vec![[0.5, 0.5]]);
     }
 }

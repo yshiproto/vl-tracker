@@ -107,7 +107,11 @@ fn box_frame(layout: Layout, clickable: bool) -> egui::Frame {
         Layout::AgentSelect => panel_frame().inner_margin(4.0).corner_radius(4.0),
         Layout::Loading => panel_frame(),
     };
-    if clickable { frame.stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.7))) } else { frame }
+    if clickable {
+        frame.stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.7)))
+    } else {
+        frame
+    }
 }
 
 fn box_size(layout: Layout) -> Vec2 {
@@ -133,7 +137,11 @@ impl App {
         if self.overlay.calibrating.take().is_some() {
             self.save_config();
         } else {
-            let layout = if self.status == Status::Loading { Layout::Loading } else { Layout::AgentSelect };
+            let layout = if self.status == Status::Loading {
+                Layout::Loading
+            } else {
+                Layout::AgentSelect
+            };
             self.overlay.calibrating = Some(layout);
         }
     }
@@ -159,13 +167,20 @@ impl App {
             self.overlay.window = None;
             return;
         };
-        let interactive = matches!(mode, Mode::Calibrate(_)) || self.overlay.visibility == Visibility::Clickable;
-        let title = if interactive { INTERACTIVE_TITLE } else { PASSTHROUGH_TITLE };
+        let interactive =
+            matches!(mode, Mode::Calibrate(_)) || self.overlay.visibility == Visibility::Clickable;
+        let title = if interactive {
+            INTERACTIVE_TITLE
+        } else {
+            PASSTHROUGH_TITLE
+        };
         // Separate viewports per input mode: winit rewrites the window's extended style whenever its
         // flags change, so the click-through setting is fixed at creation instead of toggled.
         let id = ViewportId::from_hash_of(title);
 
-        let ppp = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or(1.0);
+        let ppp = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0);
         let screen = win32::primary_monitor_px()
             .map(|[w, h]| Vec2::new(w, h) / ppp)
             .or_else(|| ctx.input(|i| i.viewport().monitor_size))
@@ -203,7 +218,13 @@ impl App {
         });
     }
 
-    fn style_overlay_window(&mut self, ctx: &egui::Context, id: ViewportId, title: &str, interactive: bool) {
+    fn style_overlay_window(
+        &mut self,
+        ctx: &egui::Context,
+        id: ViewportId,
+        title: &str,
+        interactive: bool,
+    ) {
         if self.overlay.window.is_some_and(|(v, _)| v == id) {
             return;
         }
@@ -223,14 +244,21 @@ impl App {
 
     /// Clips the window to `rects` (points) so the rest of the screen stays the game's.
     fn apply_region(&mut self, ctx: &egui::Context, rects: Option<Vec<Rect>>) {
-        let Some((_, hwnd)) = self.overlay.window else { return };
+        let Some((_, hwnd)) = self.overlay.window else {
+            return;
+        };
         let ppp = ctx.pixels_per_point();
         let px = rects.map(|rects| {
             rects
                 .iter()
                 .map(|r| {
                     let r = r.expand(2.0);
-                    [(r.min.x * ppp) as i32, (r.min.y * ppp) as i32, (r.max.x * ppp).ceil() as i32, (r.max.y * ppp).ceil() as i32]
+                    [
+                        (r.min.x * ppp) as i32,
+                        (r.min.y * ppp) as i32,
+                        (r.max.x * ppp).ceil() as i32,
+                        (r.max.y * ppp).ceil() as i32,
+                    ]
                 })
                 .collect::<Vec<_>>()
         });
@@ -257,7 +285,11 @@ impl App {
                             self.overlay.hide();
                         }
                         let action = if live { "hide" } else { "click-through" };
-                        ui.label(RichText::new(format!("{}: {action}", self.config.overlay.hotkey)).small().weak());
+                        ui.label(
+                            RichText::new(format!("{}: {action}", self.config.overlay.hotkey))
+                                .small()
+                                .weak(),
+                        );
                     });
                 })
             });
@@ -266,13 +298,28 @@ impl App {
 
     /// Player boxes for agent select (allies under their cards) or the loading screen (everyone on
     /// their banner), plus the open detail card.
-    fn draw_boxes(&mut self, ctx: &egui::Context, layout: Layout, screen: Vec2, clickable: bool) -> Vec<Rect> {
+    fn draw_boxes(
+        &mut self,
+        ctx: &egui::Context,
+        layout: Layout,
+        screen: Vec2,
+        clickable: bool,
+    ) -> Vec<Rect> {
         let cfg = &self.config.overlay;
         let groups = match layout {
-            Layout::AgentSelect => vec![(self.screen_order(Side::Ally, true), cfg.agent_select.clone())],
+            Layout::AgentSelect => vec![(
+                self.screen_order(Side::Ally, true),
+                cfg.agent_select.clone(),
+            )],
             Layout::Loading => vec![
-                (self.screen_order(Side::Ally, false), cfg.loading_ally.clone()),
-                (self.screen_order(Side::Enemy, false), cfg.loading_enemy.clone()),
+                (
+                    self.screen_order(Side::Ally, false),
+                    cfg.loading_ally.clone(),
+                ),
+                (
+                    self.screen_order(Side::Enemy, false),
+                    cfg.loading_enemy.clone(),
+                ),
             ],
         };
         let card_anchor = to_screen(cfg.agent_select_card, screen);
@@ -280,19 +327,30 @@ impl App {
         let mut open = None;
         for (g, (slots, anchors)) in groups.into_iter().enumerate() {
             for (i, (slot, anchor)) in slots.iter().zip(&anchors).enumerate() {
-                let resp = egui::Area::new(Id::unique(("overlay_box", layout == Layout::Loading, g, i)))
-                    .current_pos(to_screen(*anchor, screen))
-                    .interactable(clickable)
-                    .sense(if clickable { Sense::click() } else { Sense::hover() })
-                    .order(egui::Order::Foreground)
-                    .show(ctx, |ui| {
-                        box_frame(layout, clickable).show(ui, |ui| match layout {
-                            Layout::AgentSelect => self.compact_box(ui, slot),
-                            Layout::Loading => self.stat_box(ui, slot),
+                let resp =
+                    egui::Area::new(Id::unique(("overlay_box", layout == Layout::Loading, g, i)))
+                        .current_pos(to_screen(*anchor, screen))
+                        .interactable(clickable)
+                        .sense(if clickable {
+                            Sense::click()
+                        } else {
+                            Sense::hover()
                         })
-                    });
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            box_frame(layout, clickable).show(ui, |ui| match layout {
+                                Layout::AgentSelect => self.compact_box(ui, slot),
+                                Layout::Loading => self.stat_box(ui, slot),
+                            })
+                        });
                 let rect = resp.response.rect;
-                if clickable && !slot.hidden && resp.response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                if clickable
+                    && !slot.hidden
+                    && resp
+                        .response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                {
                     let was_open = self.overlay.expanded.as_deref() == Some(slot.puuid.as_str());
                     self.overlay.expanded = (!was_open).then(|| slot.puuid.clone());
                 }
@@ -307,7 +365,9 @@ impl App {
             let (pos, pivot) = match layout {
                 Layout::AgentSelect => (card_anchor, Align2::LEFT_BOTTOM),
                 // Open toward the centre of the screen, beside the box.
-                Layout::Loading if rect.center().x < screen.x / 2.0 => (rect.right_top() + Vec2::new(8.0, 0.0), Align2::LEFT_TOP),
+                Layout::Loading if rect.center().x < screen.x / 2.0 => {
+                    (rect.right_top() + Vec2::new(8.0, 0.0), Align2::LEFT_TOP)
+                }
                 Layout::Loading => (rect.left_top() - Vec2::new(8.0, 0.0), Align2::RIGHT_TOP),
             };
             let card = egui::Area::new(Id::unique("detail_card"))
@@ -315,7 +375,9 @@ impl App {
                 .pivot(pivot)
                 .constrain(true)
                 .order(egui::Order::Foreground)
-                .show(ctx, |ui| panel_frame().show(ui, |ui| self.detail_card(ui, &slot.puuid)));
+                .show(ctx, |ui| {
+                    panel_frame().show(ui, |ui| self.detail_card(ui, &slot.puuid))
+                });
             rects.push(card.response.rect);
         }
         rects
@@ -329,7 +391,10 @@ impl App {
             .show(ctx, |ui| {
                 panel_frame().inner_margin(14.0).show(ui, |ui| {
                     let ffa = self.roster.as_ref().is_some_and(|r| r.ffa);
-                    let (allies, enemies) = (self.ordered_slots(Side::Ally), self.ordered_slots(Side::Enemy));
+                    let (allies, enemies) = (
+                        self.ordered_slots(Side::Ally),
+                        self.ordered_slots(Side::Enemy),
+                    );
                     let groups: &[(&str, &[Slot])] = if ffa {
                         &[("Players", &allies)]
                     } else {
@@ -351,10 +416,16 @@ impl App {
                         ui.label(RichText::new("Overlay calibration").strong());
                         ui.label(RichText::new("drag each box beside its player").weak());
                         ui.separator();
-                        if ui.selectable_label(layout == Layout::AgentSelect, "Agent select").clicked() {
+                        if ui
+                            .selectable_label(layout == Layout::AgentSelect, "Agent select")
+                            .clicked()
+                        {
                             self.overlay.calibrating = Some(Layout::AgentSelect);
                         }
-                        if ui.selectable_label(layout == Layout::Loading, "Loading screen").clicked() {
+                        if ui
+                            .selectable_label(layout == Layout::Loading, "Loading screen")
+                            .clicked()
+                        {
                             self.overlay.calibrating = Some(Layout::Loading);
                         }
                         ui.separator();
@@ -384,18 +455,37 @@ impl App {
         let cfg = &mut self.config.overlay;
         let groups: Vec<(&str, &mut Vec<[f32; 2]>)> = match layout {
             Layout::AgentSelect => vec![("Teammate", &mut cfg.agent_select)],
-            Layout::Loading => vec![("Ally", &mut cfg.loading_ally), ("Enemy", &mut cfg.loading_enemy)],
+            Layout::Loading => vec![
+                ("Ally", &mut cfg.loading_ally),
+                ("Enemy", &mut cfg.loading_enemy),
+            ],
         };
         for (label, anchors) in groups {
             for (i, anchor) in anchors.iter_mut().enumerate() {
                 let text = format!("{label} {}", i + 1);
-                drag_placeholder(ctx, ("calibrate_box", label, i), anchor, screen, size, Align2::LEFT_TOP, &text);
+                drag_placeholder(
+                    ctx,
+                    ("calibrate_box", label, i),
+                    anchor,
+                    screen,
+                    size,
+                    Align2::LEFT_TOP,
+                    &text,
+                );
             }
         }
         if layout == Layout::AgentSelect {
             let size = Vec2::new(CARD_WIDTH, 160.0);
             let anchor = &mut cfg.agent_select_card;
-            drag_placeholder(ctx, "calibrate_card", anchor, screen, size, Align2::LEFT_BOTTOM, "Detail card");
+            drag_placeholder(
+                ctx,
+                "calibrate_card",
+                anchor,
+                screen,
+                size,
+                Align2::LEFT_BOTTOM,
+                "Detail card",
+            );
         }
     }
 
@@ -409,9 +499,13 @@ impl App {
             return;
         }
         let info = self.players.get(&slot.puuid);
-        let name = info.and_then(|p| p.riot_id.as_deref()).map_or("…", |id| id.split('#').next().unwrap_or(id));
+        let name = info
+            .and_then(|p| p.riot_id.as_deref())
+            .map_or("…", |id| id.split('#').next().unwrap_or(id));
         let rating = match info.map(|p| &p.impact) {
-            Some(Fetch::Ready(i)) => RichText::new(format!("{:.2}", i.rating)).strong().color(impact_label(i.rating).1),
+            Some(Fetch::Ready(i)) => RichText::new(format!("{:.2}", i.rating))
+                .strong()
+                .color(impact_label(i.rating).1),
             Some(Fetch::Unavailable(_)) => RichText::new("—").weak(),
             Some(Fetch::Pending) | None => RichText::new("…").weak(),
         };
@@ -443,7 +537,10 @@ impl App {
         let info = self.players.get(&slot.puuid);
         ui.horizontal(|ui| {
             match badge {
-                Some(tex) => ui.add(egui::Image::new(egui::load::SizedTexture::new(tex, Vec2::splat(BADGE)))),
+                Some(tex) => ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    tex,
+                    Vec2::splat(BADGE),
+                ))),
                 None => ui.allocate_exact_size(Vec2::splat(BADGE), Sense::hover()).1,
             };
             ui.vertical(|ui| {
@@ -458,7 +555,12 @@ impl App {
             match info.map(|p| &p.impact) {
                 Some(Fetch::Ready(i)) => {
                     let (_, color) = impact_label(i.rating);
-                    ui.label(RichText::new(format!("Impact {:.2}", i.rating)).small().strong().color(color));
+                    ui.label(
+                        RichText::new(format!("Impact {:.2}", i.rating))
+                            .small()
+                            .strong()
+                            .color(color),
+                    );
                 }
                 Some(Fetch::Unavailable(_)) => {
                     ui.label(RichText::new("Impact —").small().weak());
@@ -475,8 +577,15 @@ impl App {
     /// local player moved to the middle card in agent select. (Matches the reference screenshots;
     /// each box shows the player's name so a different order would be obvious.)
     fn screen_order(&self, side: Side, center_self: bool) -> Vec<Slot> {
-        let Some(roster) = &self.roster else { return Vec::new() };
-        let mut slots: Vec<Slot> = roster.slots.iter().filter(|s| roster.ffa || s.side == side).cloned().collect();
+        let Some(roster) = &self.roster else {
+            return Vec::new();
+        };
+        let mut slots: Vec<Slot> = roster
+            .slots
+            .iter()
+            .filter(|s| roster.ffa || s.side == side)
+            .cloned()
+            .collect();
         if roster.ffa && side == Side::Enemy {
             return Vec::new();
         }
@@ -492,7 +601,9 @@ impl App {
             Fetch::Ready(p) if p.current.tier > 0 => {
                 let name = self.tier_label(p.current.tier);
                 let short = match name.split_once(' ') {
-                    Some((tier, div)) => format!("{} {div}", tier.chars().take(3).collect::<String>()),
+                    Some((tier, div)) => {
+                        format!("{} {div}", tier.chars().take(3).collect::<String>())
+                    }
                     None => name,
                 };
                 format!("{short} · {} RR", p.current.rr)
@@ -503,11 +614,18 @@ impl App {
 
     /// Slots on one side, local player first. FFA lobbies list everyone once, under `Ally`.
     fn ordered_slots(&self, side: Side) -> Vec<Slot> {
-        let Some(roster) = &self.roster else { return Vec::new() };
+        let Some(roster) = &self.roster else {
+            return Vec::new();
+        };
         if roster.ffa && side == Side::Enemy {
             return Vec::new();
         }
-        let mut slots: Vec<Slot> = roster.slots.iter().filter(|s| roster.ffa || s.side == side).cloned().collect();
+        let mut slots: Vec<Slot> = roster
+            .slots
+            .iter()
+            .filter(|s| roster.ffa || s.side == side)
+            .cloned()
+            .collect();
         slots.sort_by_key(|s| !s.is_self);
         slots
     }
@@ -549,17 +667,23 @@ fn drag_placeholder(
         .sense(Sense::drag())
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            panel_frame().inner_margin(4.0).stroke(egui::Stroke::new(1.5, ACCENT)).show(ui, |ui| {
-                ui.set_min_size(size - Vec2::splat(8.0));
-                ui.set_max_width(size.x - 8.0);
-                ui.label(RichText::new(label).small().strong());
-                ui.label(RichText::new("drag").small().weak());
-            })
+            panel_frame()
+                .inner_margin(4.0)
+                .stroke(egui::Stroke::new(1.5, ACCENT))
+                .show(ui, |ui| {
+                    ui.set_min_size(size - Vec2::splat(8.0));
+                    ui.set_max_width(size.x - 8.0);
+                    ui.label(RichText::new(label).small().strong());
+                    ui.label(RichText::new("drag").small().weak());
+                })
         });
     let delta = resp.response.drag_delta();
     if delta != Vec2::ZERO {
         let pos = to_screen(*anchor, screen) + delta;
-        *anchor = [(pos.x / screen.x).clamp(0.0, 1.0), (pos.y / screen.y).clamp(0.0, 1.0)];
+        *anchor = [
+            (pos.x / screen.x).clamp(0.0, 1.0),
+            (pos.y / screen.y).clamp(0.0, 1.0),
+        ];
     }
 }
 
@@ -571,24 +695,43 @@ mod tests {
     fn hotkey_toggles_clickable_and_hide_is_separate() {
         let mut o = OverlayState::default();
         o.on_status(Status::AgentSelect);
-        assert_eq!(o.visibility, Visibility::ClickThrough, "agent select shows the overlay click-through");
+        assert_eq!(
+            o.visibility,
+            Visibility::ClickThrough,
+            "agent select shows the overlay click-through"
+        );
         o.toggle_clickable(Status::AgentSelect);
         assert_eq!(o.visibility, Visibility::Clickable);
         o.expanded = Some("p".into());
         o.toggle_clickable(Status::AgentSelect);
-        assert_eq!((o.visibility, o.expanded.as_deref()), (Visibility::ClickThrough, None));
+        assert_eq!(
+            (o.visibility, o.expanded.as_deref()),
+            (Visibility::ClickThrough, None)
+        );
         o.toggle_clickable(Status::AgentSelect);
         o.hide();
         assert_eq!(o.visibility, Visibility::Hidden);
         o.toggle_clickable(Status::AgentSelect);
-        assert_eq!(o.visibility, Visibility::Clickable, "the hotkey brings a hidden overlay back clickable");
+        assert_eq!(
+            o.visibility,
+            Visibility::Clickable,
+            "the hotkey brings a hidden overlay back clickable"
+        );
 
         o.on_status(Status::LiveMatch);
-        assert_eq!(o.visibility, Visibility::Hidden, "the match starts with the overlay hidden");
+        assert_eq!(
+            o.visibility,
+            Visibility::Hidden,
+            "the match starts with the overlay hidden"
+        );
         o.toggle_clickable(Status::LiveMatch);
         assert_eq!(o.visibility, Visibility::Clickable);
         o.toggle_clickable(Status::LiveMatch);
-        assert_eq!(o.visibility, Visibility::Hidden, "no click-through scoreboard left over the game");
+        assert_eq!(
+            o.visibility,
+            Visibility::Hidden,
+            "no click-through scoreboard left over the game"
+        );
     }
 
     #[test]
@@ -601,7 +744,13 @@ mod tests {
             hidden: false,
             is_self: me,
         };
-        let mut slots = vec![slot("me", true), slot("a", false), slot("b", false), slot("c", false), slot("d", false)];
+        let mut slots = vec![
+            slot("me", true),
+            slot("a", false),
+            slot("b", false),
+            slot("c", false),
+            slot("d", false),
+        ];
         move_self_to_middle(&mut slots);
         let order: Vec<&str> = slots.iter().map(|s| s.puuid.as_str()).collect();
         assert_eq!(order, ["a", "b", "me", "c", "d"]);

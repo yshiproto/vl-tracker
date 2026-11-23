@@ -22,8 +22,10 @@ use tokio::time::{Instant, sleep_until};
 use crate::henrik_api::{Account, Henrik, IMPACT_PAGE};
 use crate::impact::{self, MatchDto, WinModel};
 use crate::match_cache::MatchCache;
-use crate::model::{Command, Depth, Error, Event, Fetch, IconKey, Progress, Result, Roster, Status, UiSink};
-use crate::riot_local::{LogTail, Lockfile, LoopState, RiotSession};
+use crate::model::{
+    Command, Depth, Error, Event, Fetch, IconKey, Progress, Result, Roster, Status, UiSink,
+};
+use crate::riot_local::{Lockfile, LogTail, LoopState, RiotSession};
 use crate::val_assets::{self, Assets};
 
 const IDLE_POLL: Duration = Duration::from_secs(5);
@@ -47,29 +49,50 @@ pub fn spawn(
     let (event_tx, event_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let ui = UiSink::new(event_tx, ctx);
-    let spawned = std::thread::Builder::new().name("vltracker-worker".into()).spawn({
-        let ui = ui.clone();
-        move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return ui.send(Event::Notice(Some(format!("Failed to start runtime: {e}")))),
-            };
-            match Worker::new(ui.clone(), api_key, round_start_markers) {
-                Ok(worker) => rt.block_on(worker.run(cmd_rx)),
-                Err(e) => ui.send(Event::Notice(Some(format!("Failed to start HTTP client: {e}")))),
+    let spawned = std::thread::Builder::new()
+        .name("vltracker-worker".into())
+        .spawn({
+            let ui = ui.clone();
+            move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        return ui
+                            .send(Event::Notice(Some(format!("Failed to start runtime: {e}"))));
+                    }
+                };
+                match Worker::new(ui.clone(), api_key, round_start_markers) {
+                    Ok(worker) => rt.block_on(worker.run(cmd_rx)),
+                    Err(e) => ui.send(Event::Notice(Some(format!(
+                        "Failed to start HTTP client: {e}"
+                    )))),
+                }
             }
-        }
-    });
+        });
     if let Err(e) = spawned {
-        ui.send(Event::Notice(Some(format!("Failed to start worker thread: {e}"))));
+        ui.send(Event::Notice(Some(format!(
+            "Failed to start worker thread: {e}"
+        ))));
     }
     (event_rx, cmd_tx)
 }
 
 enum TaskDone {
     /// `ok == false` means a transient failure; the player is re-scheduled on the next tick.
-    Player { puuid: String, ok: bool, cheap_ok: bool, depth: Depth, had_assets: bool },
-    Lookup { query: String, result: Result<Account> },
+    Player {
+        puuid: String,
+        ok: bool,
+        cheap_ok: bool,
+        depth: Depth,
+        had_assets: bool,
+    },
+    Lookup {
+        query: String,
+        result: Result<Account>,
+    },
 }
 
 /// Notices from independent sources are tracked separately so one clearing doesn't hide another.
@@ -197,7 +220,13 @@ impl Worker {
 
     fn task_done(&mut self, done: TaskDone) {
         match done {
-            TaskDone::Player { puuid, ok, cheap_ok, depth, had_assets } => {
+            TaskDone::Player {
+                puuid,
+                ok,
+                cheap_ok,
+                depth,
+                had_assets,
+            } => {
                 if cheap_ok {
                     self.cheap_fetched.insert(puuid.clone(), Instant::now());
                 }
@@ -214,8 +243,14 @@ impl Worker {
             TaskDone::Lookup { query, result } => match result {
                 Ok(account) if self.lookup_query.as_deref() == Some(&query) => {
                     self.named.insert(account.puuid.clone());
-                    self.ui.send(Event::Name { puuid: account.puuid.clone(), riot_id: account.riot_id });
-                    self.ui.send(Event::LookupResolved { query, puuid: account.puuid.clone() });
+                    self.ui.send(Event::Name {
+                        puuid: account.puuid.clone(),
+                        riot_id: account.riot_id,
+                    });
+                    self.ui.send(Event::LookupResolved {
+                        query,
+                        puuid: account.puuid.clone(),
+                    });
                     self.lookup_target = Some((account.puuid.clone(), account.region.clone()));
                     self.schedule(&account.puuid, &account.region);
                 }
@@ -270,7 +305,9 @@ impl Worker {
             },
             // Roster loaded: presence leaving INGAME is what ends the match, no remote calls
             // beyond following the log while the loading screen is up.
-            LoopState::InGame if self.roster_is_core && self.roster.is_some() => Ok(self.poll_loading()),
+            LoopState::InGame if self.roster_is_core && self.roster.is_some() => {
+                Ok(self.poll_loading())
+            }
             LoopState::InGame => match self.poll_core(&session).await {
                 Ok(false) => {
                     self.set_roster(None, false);
@@ -301,14 +338,21 @@ impl Worker {
         }
         if self.session.is_none() {
             let lock = self.lockfile.as_ref()?;
-            let fallback = self.assets.as_ref().and_then(|a| a.client_version.as_deref());
-            match RiotSession::connect(lock, self.local.clone(), self.remote.clone(), fallback).await {
+            let fallback = self
+                .assets
+                .as_ref()
+                .and_then(|a| a.client_version.as_deref());
+            match RiotSession::connect(lock, self.local.clone(), self.remote.clone(), fallback)
+                .await
+            {
                 Ok(s) => {
                     self.session = Some(Arc::new(s));
                     self.set_notice(NoticeSource::Riot, None);
                 }
                 // Not logged in / still booting surfaces as HTTP errors; stay quiet and retry.
-                Err(e @ Error::Missing(_)) => self.set_notice(NoticeSource::Riot, Some(format!("Riot Client: {e}"))),
+                Err(e @ Error::Missing(_)) => {
+                    self.set_notice(NoticeSource::Riot, Some(format!("Riot Client: {e}")))
+                }
                 Err(_) => {}
             }
         }
@@ -317,7 +361,9 @@ impl Worker {
 
     /// Returns whether an agent-select lobby exists.
     async fn poll_pregame(&mut self, session: &RiotSession) -> Result<bool> {
-        let Some(id) = session.pregame_match_id().await? else { return Ok(false) };
+        let Some(id) = session.pregame_match_id().await? else {
+            return Ok(false);
+        };
         // Re-read every tick: hovered/locked agents change during selection.
         let roster = session.pregame_roster(&id).await?;
         self.set_status(Status::AgentSelect);
@@ -328,7 +374,9 @@ impl Worker {
 
     /// Returns whether a loaded match exists. Fetches the roster only for a new match ID.
     async fn poll_core(&mut self, session: &RiotSession) -> Result<bool> {
-        let Some(id) = session.core_match_id().await? else { return Ok(false) };
+        let Some(id) = session.core_match_id().await? else {
+            return Ok(false);
+        };
         let known = self.roster_is_core && self.roster.as_ref().is_some_and(|r| r.match_id == id);
         if !known {
             let roster = session.core_roster(&id).await?;
@@ -336,13 +384,19 @@ impl Worker {
             // Only a match entered from agent select has a loading screen we watched start.
             self.loading = self.log_tail.take().map(|tail| (tail, Instant::now()));
         }
-        self.set_status(if self.loading.is_some() { Status::Loading } else { Status::LiveMatch });
+        self.set_status(if self.loading.is_some() {
+            Status::Loading
+        } else {
+            Status::LiveMatch
+        });
         Ok(true)
     }
 
     /// Ends the loading phase on the first round-start log line (or after `LOADING_MAX`).
     fn poll_loading(&mut self) -> Duration {
-        let Some((tail, since)) = &mut self.loading else { return MATCH_POLL };
+        let Some((tail, since)) = &mut self.loading else {
+            return MATCH_POLL;
+        };
         if !tail.saw_any(&self.round_start_markers) && since.elapsed() < LOADING_MAX {
             return LOADING_POLL;
         }
@@ -374,7 +428,11 @@ impl Worker {
             .filter(|s| !s.hidden && !self.named.contains(&s.puuid))
             .map(|s| s.puuid.as_str())
             .collect();
-        let names = if unnamed.is_empty() { Ok(Vec::new()) } else { session.names(&unnamed).await };
+        let names = if unnamed.is_empty() {
+            Ok(Vec::new())
+        } else {
+            session.names(&unnamed).await
+        };
         self.set_roster(Some(roster), is_core);
         // On failure, unresolved players fall back to a HenrikDev account lookup in their fetch job.
         for (puuid, riot_id) in names.unwrap_or_default() {
@@ -408,12 +466,20 @@ impl Worker {
         if self.in_flight.contains(puuid) {
             return;
         }
-        let cheap_fresh = self.cheap_fetched.get(puuid).is_some_and(|t| t.elapsed() < PLAYER_TTL);
-        if self.fetched.get(puuid).is_some_and(|(t, d)| t.elapsed() < PLAYER_TTL && *d == depth) {
+        let cheap_fresh = self
+            .cheap_fetched
+            .get(puuid)
+            .is_some_and(|t| t.elapsed() < PLAYER_TTL);
+        if self
+            .fetched
+            .get(puuid)
+            .is_some_and(|(t, d)| t.elapsed() < PLAYER_TTL && *d == depth)
+        {
             return;
         }
         self.in_flight.insert(puuid.to_owned());
-        self.fetched.insert(puuid.to_owned(), (Instant::now(), depth));
+        self.fetched
+            .insert(puuid.to_owned(), (Instant::now(), depth));
         let job = PlayerJob {
             session: self.session.clone(),
             henrik: self.henrik.clone(),
@@ -432,11 +498,16 @@ impl Worker {
     }
 
     fn lookup(&mut self, query: String) {
-        let parsed = query.rsplit_once('#').map(|(n, t)| (n.trim().to_owned(), t.trim().to_owned()));
+        let parsed = query
+            .rsplit_once('#')
+            .map(|(n, t)| (n.trim().to_owned(), t.trim().to_owned()));
         self.lookup_query = Some(query.clone());
         self.lookup_target = None;
         let Some((name, tag)) = parsed.filter(|(n, t)| !n.is_empty() && !t.is_empty()) else {
-            return self.ui.send(Event::LookupFailed { query, reason: "Use the format Name#Tag".into() });
+            return self.ui.send(Event::LookupFailed {
+                query,
+                reason: "Use the format Name#Tag".into(),
+            });
         };
         let henrik = self.henrik.clone();
         self.tasks.spawn(async move {
@@ -470,7 +541,9 @@ impl Worker {
         let Some(assets) = &self.assets else {
             return self.icons_waiting.push(key);
         };
-        let Some(url) = assets.icon_url(&key).map(str::to_owned) else { return };
+        let Some(url) = assets.icon_url(&key).map(str::to_owned) else {
+            return;
+        };
         let (http, ui) = (self.remote.clone(), self.ui.clone());
         // Fire-and-forget: a failed icon just renders as an empty slot.
         tokio::spawn(async move {
@@ -500,12 +573,20 @@ impl Worker {
 
     fn set_notice(&mut self, source: NoticeSource, notice: Option<String>) {
         let changed = match notice {
-            Some(msg) => self.notices.insert(source, msg.clone()).is_none_or(|old| old != msg),
+            Some(msg) => self
+                .notices
+                .insert(source, msg.clone())
+                .is_none_or(|old| old != msg),
             None => self.notices.remove(&source).is_some(),
         };
         if changed {
-            let joined = (!self.notices.is_empty())
-                .then(|| self.notices.values().map(String::as_str).collect::<Vec<_>>().join("  ·  "));
+            let joined = (!self.notices.is_empty()).then(|| {
+                self.notices
+                    .values()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("  ·  ")
+            });
             self.ui.send(Event::Notice(joined));
         }
     }
@@ -544,7 +625,10 @@ impl PlayerJob {
 
         if self.need_name {
             match self.henrik.account_by_puuid(&self.puuid).await {
-                Ok(a) => self.ui.send(Event::Name { puuid: self.puuid.clone(), riot_id: a.riot_id }),
+                Ok(a) => self.ui.send(Event::Name {
+                    puuid: self.puuid.clone(),
+                    riot_id: a.riot_id,
+                }),
                 Err(e) => transient |= e.is_transient(),
             }
         }
@@ -560,11 +644,17 @@ impl PlayerJob {
                 Err(_) => self.henrik.rank(&self.region, &self.puuid).await,
             };
             cheap_transient |= rank.as_ref().is_err_and(Error::is_transient);
-            self.ui.send(Event::Rank { puuid: self.puuid.clone(), rank: Fetch::from(rank) });
+            self.ui.send(Event::Rank {
+                puuid: self.puuid.clone(),
+                rank: Fetch::from(rank),
+            });
 
             let stats = self.henrik.stats(&self.region, &self.puuid).await;
             cheap_transient |= stats.as_ref().is_err_and(Error::is_transient);
-            self.ui.send(Event::Stats { puuid: self.puuid.clone(), stats: Fetch::from(stats) });
+            self.ui.send(Event::Stats {
+                puuid: self.puuid.clone(),
+                stats: Fetch::from(stats),
+            });
         }
 
         transient |= self.deep_stats().await;
@@ -585,7 +675,11 @@ impl PlayerJob {
             Some(s) => s.current_act().await.ok(),
             None => None,
         }
-        .or_else(|| self.assets.as_ref().and_then(|a| a.latest_act().map(str::to_owned)));
+        .or_else(|| {
+            self.assets
+                .as_ref()
+                .and_then(|a| a.latest_act().map(str::to_owned))
+        });
         let target0 = depth_from_u8(self.depth.load(Ordering::Relaxed));
         if target0 == Depth::Act && act.is_none() {
             self.unavailable(Depth::Act, "Current act unavailable");
@@ -631,11 +725,17 @@ impl PlayerJob {
             }
             let have = matches.len() as u32;
             let act_done = act.as_deref().is_some_and(|a| {
-                matches.last().is_some_and(|m| m.act().as_deref().is_some_and(|b| b != a))
+                matches
+                    .last()
+                    .is_some_and(|m| m.act().as_deref().is_some_and(|b| b != a))
             });
             let history_complete = exhausted || act_done;
             let done = history_complete || have >= depth_matches(target);
-            let depth = if done { target } else { staged_depth(have, history_complete).min(target) };
+            let depth = if done {
+                target
+            } else {
+                staged_depth(have, history_complete).min(target)
+            };
             self.publish(&matches, depth, &act, done, history_complete);
             if done {
                 return false;
@@ -663,21 +763,35 @@ impl PlayerJob {
             if wait > 0 {
                 self.ui.send(Event::ImpactProgress {
                     puuid: self.puuid.clone(),
-                    progress: Progress::RateLimited { have: start, target, resume_secs: wait },
+                    progress: Progress::RateLimited {
+                        have: start,
+                        target,
+                        resume_secs: wait,
+                    },
                 });
                 tokio::time::sleep(Duration::from_secs(wait.into())).await;
                 continue;
             }
             self.ui.send(Event::ImpactProgress {
                 puuid: self.puuid.clone(),
-                progress: Progress::Fetching { have: start, target },
+                progress: Progress::Fetching {
+                    have: start,
+                    target,
+                },
             });
-            return match self.henrik.recent_matches(&self.region, &self.puuid, start).await {
+            return match self
+                .henrik
+                .recent_matches(&self.region, &self.puuid, start)
+                .await
+            {
                 Ok(page) => {
                     self.report_quota();
                     Page::Ok(page)
                 }
-                Err(e) => Page::Failed { transient: e.is_transient(), reason: e.to_string() },
+                Err(e) => Page::Failed {
+                    transient: e.is_transient(),
+                    reason: e.to_string(),
+                },
             };
         }
     }
@@ -688,20 +802,36 @@ impl PlayerJob {
             depth,
             impact: Fetch::Unavailable(reason.to_owned()),
         });
-        self.ui.send(Event::ImpactProgress { puuid: self.puuid.clone(), progress: Progress::Done });
+        self.ui.send(Event::ImpactProgress {
+            puuid: self.puuid.clone(),
+            progress: Progress::Done,
+        });
     }
-
 
     /// Rates the player over `matches` (trimmed to `depth`), updates the model, and publishes.
     /// `complete` marks that nothing older is known to exist for this player.
-    fn publish(&self, matches: &[Arc<MatchDto>], depth: Depth, act: &Option<String>, done: bool, complete: bool) {
+    fn publish(
+        &self,
+        matches: &[Arc<MatchDto>],
+        depth: Depth,
+        act: &Option<String>,
+        done: bool,
+        complete: bool,
+    ) {
         let scope: Vec<Arc<MatchDto>> = match depth {
             Depth::Act => matches
                 .iter()
-                .filter(|m| act.as_deref().is_some_and(|a| m.act().as_deref() == Some(a)))
+                .filter(|m| {
+                    act.as_deref()
+                        .is_some_and(|a| m.act().as_deref() == Some(a))
+                })
                 .cloned()
                 .collect(),
-            d => matches.iter().take(depth_matches(d) as usize).cloned().collect(),
+            d => matches
+                .iter()
+                .take(depth_matches(d) as usize)
+                .cloned()
+                .collect(),
         };
         let impact = {
             let mut model = self.win_model.lock();
@@ -719,13 +849,19 @@ impl PlayerJob {
             impact: Fetch::from(impact.ok_or(Error::NotFound)),
         });
         if done {
-            self.ui.send(Event::ImpactProgress { puuid: self.puuid.clone(), progress: Progress::Done });
+            self.ui.send(Event::ImpactProgress {
+                puuid: self.puuid.clone(),
+                progress: Progress::Done,
+            });
         }
     }
 
     fn report_quota(&self) {
         if let Some(q) = self.henrik.quota() {
-            self.ui.send(Event::Quota { remaining: q.remaining, reset_secs: q.reset_secs });
+            self.ui.send(Event::Quota {
+                remaining: q.remaining,
+                reset_secs: q.reset_secs,
+            });
         }
     }
 }
@@ -752,7 +888,10 @@ fn staged_depth(have: u32, history_complete: bool) -> Depth {
 fn prefix_matches(matches: &[Arc<MatchDto>], page: &[MatchDto]) -> bool {
     !page.is_empty()
         && matches.len() >= page.len()
-        && matches.iter().zip(page).all(|(old, new)| old.id() == new.id())
+        && matches
+            .iter()
+            .zip(page)
+            .all(|(old, new)| old.id() == new.id())
 }
 
 fn depth_from_u8(v: u8) -> Depth {
@@ -776,7 +915,10 @@ mod tests {
     use super::*;
 
     fn dto(id: &str) -> MatchDto {
-        serde_json::from_str(&format!(r#"{{"metadata":{{"match_id":"{id}"}},"players":[]}}"#)).unwrap()
+        serde_json::from_str(&format!(
+            r#"{{"metadata":{{"match_id":"{id}"}},"players":[]}}"#
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -795,9 +937,13 @@ mod tests {
         let same: Vec<Arc<MatchDto>> = page.iter().map(|m| Arc::new(dto(m.id()))).collect();
         assert!(prefix_matches(&same, &page));
         // A page that disagrees about what the newest matches are breaks the chain.
-        let reordered: Vec<Arc<MatchDto>> = page.iter().rev().map(|m| Arc::new(dto(m.id()))).collect();
+        let reordered: Vec<Arc<MatchDto>> =
+            page.iter().rev().map(|m| Arc::new(dto(m.id()))).collect();
         assert!(!prefix_matches(&reordered, &page));
-        assert!(!prefix_matches(&[], &page), "an empty cache never confirms anything");
+        assert!(
+            !prefix_matches(&[], &page),
+            "an empty cache never confirms anything"
+        );
         assert!(!prefix_matches(&same, &[]), "an empty page proves nothing");
     }
 
