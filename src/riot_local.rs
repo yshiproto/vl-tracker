@@ -581,7 +581,10 @@ impl LogTail {
 
     /// Starts at the current end of the game log, so only future lines are seen.
     pub fn game_log_at_end() -> Option<Self> {
-        let path = game_log_path()?;
+        Self::at_end(game_log_path()?)
+    }
+
+    pub(crate) fn at_end(path: PathBuf) -> Option<Self> {
         let offset = std::fs::metadata(&path).ok()?.len();
         Some(Self { path, offset })
     }

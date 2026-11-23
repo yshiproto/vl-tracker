@@ -18,8 +18,8 @@ pub struct Config {
     pub overlay: OverlayConfig,
 }
 
-/// Overlay box positions are top-left corners as fractions of the primary monitor, so one
-/// calibration holds across resolutions with the same aspect ratio.
+/// Overlay anchors are fractions of a centred 1920×1080 game canvas. A calibrated layout
+/// follows the same cards across DPI and monitor sizes without stretching on non-16:9 displays.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OverlayConfig {
@@ -28,8 +28,8 @@ pub struct OverlayConfig {
     pub hotkey: String,
     /// Toggles calibration (drag boxes into place; saved on exit).
     pub calibrate_hotkey: String,
-    /// Layout generation the positions below belong to. Older saved positions are replaced with
-    /// the current defaults on load. Missing in old files, hence 0.
+    /// Layout generation for saved positions. Old layouts are migrated without discarding
+    /// custom calibration whenever their coordinate system still matches.
     #[serde(default)]
     pub layout_version: u32,
     /// One box under each agent-select card, left to right.
@@ -43,8 +43,8 @@ pub struct OverlayConfig {
     pub round_start_markers: Vec<String>,
 }
 
-/// Bump when the default positions change.
-const LAYOUT_VERSION: u32 = 2;
+/// Bump when the default positions or coordinate interpretation changes.
+const LAYOUT_VERSION: u32 = 3;
 
 /// Fraction of a 1920×1080 reference screen.
 fn at(x: f32, y: f32) -> [f32; 2] {
@@ -60,10 +60,10 @@ impl Default for OverlayConfig {
             hotkey: "F8".into(),
             calibrate_hotkey: "Shift+F8".into(),
             layout_version: LAYOUT_VERSION,
-            // Agent-select cards are 126 px wide every 136 px from x = 620; the free strip below
-            // them starts at y ≈ 1040 (the LOCK IN button covers the space above).
+            // Agent-select cards are 126 px wide every 136 px from x = 620. Leave space for
+            // both lines and their frame below the row, without clipping the bottom edge.
             agent_select: (0..5)
-                .map(|i| at(620.0 + 136.0 * i as f32, 1040.0))
+                .map(|i| at(620.0 + 136.0 * i as f32, 1008.0))
                 .collect(),
             // Right of the card row, clear of LOCK IN and the "enemy team locked in" indicator.
             agent_select_card: at(1305.0, 1020.0),
@@ -101,10 +101,27 @@ impl Config {
             .migrated()
     }
 
-    /// Replaces overlay positions saved by an older layout generation with the current defaults.
+    /// Old reference-screen fractions remain valid in the centred coordinate system. Only the
+    /// uncalibrated v2 agent boxes were too close to the bottom edge; preserve every moved box.
     fn migrated(mut self) -> Self {
-        if self.overlay.layout_version < LAYOUT_VERSION {
-            self.overlay.reset_positions();
+        match self.overlay.layout_version {
+            0..=1 => self.overlay.reset_positions(),
+            2 => {
+                let defaults = OverlayConfig::default();
+                for (i, (anchor, default)) in self
+                    .overlay
+                    .agent_select
+                    .iter_mut()
+                    .zip(&defaults.agent_select)
+                    .enumerate()
+                {
+                    if *anchor == at(620.0 + 136.0 * i as f32, 1040.0) {
+                        *anchor = *default;
+                    }
+                }
+                self.overlay.layout_version = LAYOUT_VERSION;
+            }
+            _ => {}
         }
         self
     }
@@ -144,5 +161,19 @@ mod tests {
             r#"{{"overlay":{{"layout_version":{LAYOUT_VERSION},"agent_select":[[0.5,0.5]]}}}}"#
         );
         assert_eq!(migrated(&current).overlay.agent_select, vec![[0.5, 0.5]]);
+    }
+
+    #[test]
+    fn v2_calibration_survives_except_unchanged_out_of_bounds_defaults() {
+        let old = format!(
+            r#"{{"overlay":{{"layout_version":2,"agent_select":[{:?},[0.4,0.5]]}}}}"#,
+            at(620.0, 1040.0)
+        );
+        let config = migrated(&old);
+        assert_eq!(
+            config.overlay.agent_select,
+            vec![OverlayConfig::default().agent_select[0], [0.4, 0.5]]
+        );
+        assert_eq!(config.overlay.layout_version, LAYOUT_VERSION);
     }
 }

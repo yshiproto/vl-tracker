@@ -59,6 +59,7 @@ struct PlayerInfo {
     /// Deepest level `impact` covers so far.
     impact_depth: Depth,
     progress: Option<Progress>,
+    progress_at: Option<std::time::Instant>,
 }
 
 enum Lookup {
@@ -97,13 +98,7 @@ struct App {
 impl App {
     fn new(ctx: &egui::Context) -> Self {
         let config = Config::load();
-        // The on-disk key wins; an env key only bootstraps a fresh config (used by the headless
-        // visual check on machines with no saved key).
-        let api_key = if config.henrik_api_key.is_empty() {
-            std::env::var("HENRIK_KEY").unwrap_or_default()
-        } else {
-            config.henrik_api_key.clone()
-        };
+        let api_key = config.henrik_api_key.clone();
         let (events, commands) = worker::spawn(
             ctx.clone(),
             api_key.clone(),
@@ -151,7 +146,16 @@ impl App {
                 self.overlay.on_status(s);
             }
             Event::Assets(a) => self.assets = Some(a),
-            Event::Roster(r) => self.roster = r,
+            Event::Roster(r) => {
+                if self.details.as_deref().is_some_and(|puuid| {
+                    !r.as_ref()
+                        .is_some_and(|roster| roster.slots.iter().any(|s| s.puuid == puuid))
+                        && !matches!(&self.lookup, Some(Lookup::Resolved(found)) if found == puuid)
+                }) {
+                    self.details = None;
+                }
+                self.roster = r;
+            }
             Event::Name { puuid, riot_id } => {
                 self.players.entry(puuid).or_default().riot_id = Some(riot_id)
             }
@@ -167,7 +171,9 @@ impl App {
                 p.impact_depth = depth;
             }
             Event::ImpactProgress { puuid, progress } => {
-                self.players.entry(puuid).or_default().progress = Some(progress);
+                let player = self.players.entry(puuid).or_default();
+                player.progress = Some(progress);
+                player.progress_at = Some(std::time::Instant::now());
             }
             Event::Quota {
                 remaining,
@@ -213,50 +219,75 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let (label, color) = match self.status {
+            Status::WaitingForClient => ("Waiting for Riot Client", Color32::GRAY),
+            Status::InMenu => ("In Menu", Color32::from_rgb(120, 170, 255)),
+            Status::AgentSelect => ("Agent Select", Color32::from_rgb(240, 200, 80)),
+            Status::Loading => ("Loading Screen", Color32::from_rgb(240, 200, 80)),
+            Status::LiveMatch => ("Live Match Detected", Color32::from_rgb(90, 210, 120)),
+        };
         ui.horizontal_wrapped(|ui| {
-            let (label, color) = match self.status {
-                Status::WaitingForClient => ("Waiting for Riot Client", Color32::GRAY),
-                Status::InMenu => ("In Menu", Color32::from_rgb(120, 170, 255)),
-                Status::AgentSelect => ("Agent Select", Color32::from_rgb(240, 200, 80)),
-                Status::Loading => ("Loading Screen", Color32::from_rgb(240, 200, 80)),
-                Status::LiveMatch => ("Live Match Detected", Color32::from_rgb(90, 210, 120)),
-            };
             let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter().circle_filled(dot.center(), 5.0, color);
             ui.label(RichText::new(label).strong());
-            ui.separator();
-
-            ui.label("HenrikDev key");
-            let key = ui.add(
-                egui::TextEdit::singleline(&mut self.key_input)
-                    .password(true)
-                    .hint_text("HDEV-…")
-                    .desired_width(200.0),
-            );
-            let submitted = key.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let changed = self.key_input.trim() != self.config.henrik_api_key;
-            if (ui.add_enabled(changed, egui::Button::new("Save")).clicked() || submitted)
-                && changed
-            {
-                self.save_key();
+            if let Some((remaining, reset, at)) = self.quota {
+                ui.separator();
+                let remaining_time = reset.saturating_sub(at.elapsed().as_secs() as u32);
+                let (text, color) = if remaining_time == 0 {
+                    (
+                        "API quota · awaiting next response".to_owned(),
+                        Color32::from_gray(140),
+                    )
+                } else {
+                    let color = if remaining < 10 {
+                        Color32::from_rgb(230, 170, 90)
+                    } else {
+                        Color32::from_gray(140)
+                    };
+                    (
+                        format!("API quota {remaining} left · resets in {remaining_time}s"),
+                        color,
+                    )
+                };
+                ui.label(RichText::new(text).small().color(color))
+                    .on_hover_text(
+                        "HenrikDev free tier: 30 requests/min, including its own calls to Riot",
+                    );
             }
-            ui.separator();
-
-            ui.label("Lookup");
-            let lookup = ui.add(
-                egui::TextEdit::singleline(&mut self.lookup_input)
-                    .hint_text("Name#Tag")
-                    .desired_width(170.0),
-            );
-            let submitted = lookup.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("Search").clicked() || submitted {
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("HenrikDev key");
+                let key = ui.add(
+                    egui::TextEdit::singleline(&mut self.key_input).password(true).hint_text("HDEV-…").desired_width(180.0),
+                );
+                let submitted = key.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let changed = self.key_input.trim() != self.config.henrik_api_key;
+                if (ui.add_enabled(changed, egui::Button::new("Save")).clicked() || submitted) && changed {
+                    self.save_key();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Lookup");
+                let lookup = ui.add(
+                    egui::TextEdit::singleline(&mut self.lookup_input).hint_text("Name#Tag").desired_width(170.0),
+                );
+                let submitted = lookup.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let query = self.lookup_input.trim().to_owned();
-                if !query.is_empty() {
+                let pending = matches!(&self.lookup, Some(Lookup::Pending(q)) if q == &query);
+                if (ui.add_enabled(!query.is_empty() && !pending, egui::Button::new("Search")).clicked() || submitted)
+                    && !query.is_empty()
+                    && !pending
+                {
+                    if matches!(&self.lookup, Some(Lookup::Resolved(old)) if self.details.as_ref() == Some(old)) {
+                        self.details = None;
+                    }
                     self.lookup = Some(Lookup::Pending(query.clone()));
                     self.send(Command::Lookup(query));
                 }
-            }
-            ui.separator();
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
             ui.label("Impact over");
             let mut depth = self.depth;
             egui::ComboBox::from_id_salt("depth")
@@ -273,28 +304,38 @@ impl App {
                         have: 0,
                         target: depth,
                     });
+                    player.progress_at = Some(std::time::Instant::now());
                 }
                 self.send(Command::SetDepth(depth));
             }
             ui.separator();
-            let hint = format!(
-                "Overlay: {} toggle · {} calibrate",
-                self.config.overlay.hotkey, self.config.overlay.calibrate_hotkey
-            );
-            ui.label(RichText::new(hint).small().weak());
-            if let Some((remaining, reset, at)) = self.quota {
-                ui.separator();
-                let reset = reset.saturating_sub(at.elapsed().as_secs() as u32);
-                let text = format!("API quota {remaining} left · resets in {reset}s");
-                let color = if remaining < 10 {
-                    Color32::from_rgb(230, 170, 90)
+            if ui
+                .add_enabled(
+                    self.roster.is_some(),
+                    egui::Button::new("Interact with overlay"),
+                )
+                .on_hover_text(format!(
+                    "Toggle click-through with {}",
+                    self.config.overlay.hotkey
+                ))
+                .clicked()
+            {
+                self.on_hotkey(Hotkey::Toggle);
+            }
+            let calibrating = self.overlay.is_calibrating();
+            if ui
+                .button(if calibrating {
+                    "Save calibration"
                 } else {
-                    Color32::from_gray(140)
-                };
-                ui.label(RichText::new(text).small().color(color))
-                    .on_hover_text(
-                        "HenrikDev free tier: 30 requests/min, including its own calls to Riot",
-                    );
+                    "Calibrate overlay"
+                })
+                .on_hover_text(format!(
+                    "Drag boxes onto player cards · {}",
+                    self.config.overlay.calibrate_hotkey
+                ))
+                .clicked()
+            {
+                self.on_hotkey(Hotkey::Calibrate);
             }
         });
         for notice in [&self.local_notice, &self.notice].into_iter().flatten() {
@@ -308,8 +349,13 @@ impl App {
 
     fn save_key(&mut self) {
         let key = self.key_input.trim().to_owned();
-        self.config.henrik_api_key = key.clone();
-        self.save_config();
+        let previous = std::mem::replace(&mut self.config.henrik_api_key, key.clone());
+        if let Err(e) = self.config.save() {
+            self.config.henrik_api_key = previous;
+            self.local_notice = Some(format!("Could not save config: {e}"));
+            return;
+        }
+        self.local_notice = None;
         self.send(Command::SetApiKey(key));
     }
 
@@ -347,11 +393,25 @@ impl App {
                     hidden: false,
                     is_self: false,
                 };
-                self.player_grid(ui, "lookup_grid", &[slot], Columns::Main);
+                egui::ScrollArea::horizontal()
+                    .id_salt("lookup_scroll")
+                    .show(ui, |ui| {
+                        self.player_grid(ui, "lookup_grid", &[slot], Columns::Main);
+                    });
             }
             None => {}
         }
         if close {
+            if matches!(&self.lookup, Some(Lookup::Resolved(old)) if self.details.as_ref() == Some(old))
+                && self.details.as_deref().is_some_and(|puuid| {
+                    !self
+                        .roster
+                        .as_ref()
+                        .is_some_and(|r| r.slots.iter().any(|s| s.puuid == puuid))
+                })
+            {
+                self.details = None;
+            }
             self.lookup = None;
         }
     }
@@ -372,14 +432,18 @@ impl App {
         slots.sort_by_key(|s| !s.is_self);
         let ffa = roster.ffa;
         let pregame = self.status == Status::AgentSelect;
-        // Two team grids side by side need ~980 pt; with the details panel open they stack instead.
-        let side_by_side = ui.available_width() >= 980.0;
+        // Two ~480-point tables fit side by side at the default width; stack below that.
+        let side_by_side = ui.available_width() >= 1000.0;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
                 if ffa {
                     ui.heading("Players");
-                    self.player_grid(ui, "ffa_grid", &slots, Columns::Main);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("ffa_scroll")
+                        .show(ui, |ui| {
+                            self.player_grid(ui, "ffa_grid", &slots, Columns::Main);
+                        });
                     return;
                 }
                 let (allies, enemies): (Vec<Slot>, Vec<Slot>) =
@@ -392,7 +456,9 @@ impl App {
                                 RichText::new("Enemies are revealed once the match loads.").weak(),
                             );
                         } else {
-                            app.player_grid(ui, id, slots, Columns::Main);
+                            egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+                                app.player_grid(ui, id, slots, Columns::Main);
+                            });
                         }
                     };
                 if side_by_side {
@@ -508,12 +574,18 @@ impl App {
                 text = text.underline();
             }
             toggle_details = ui
-                .add(egui::Label::new(text).sense(egui::Sense::click()))
+                .add_sized(
+                    [170.0, 22.0],
+                    egui::Label::new(text)
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Show details")
+                .on_hover_text(format!("Show details: {name}"))
                 .clicked();
         } else {
-            ui.label(text);
+            ui.add_sized([170.0, 22.0], egui::Label::new(text).truncate())
+                .on_hover_text(name);
         }
 
         fetch_cell(ui, &rank, |_| self.rank_text(&rank));
@@ -625,7 +697,9 @@ impl eframe::App for App {
         while let Ok(key) = self.hotkeys.try_recv() {
             self.on_hotkey(key);
         }
-        if self.quota.is_some()
+        if self
+            .quota
+            .is_some_and(|(_, reset, at)| at.elapsed().as_secs() < u64::from(reset))
             || self
                 .players
                 .values()
@@ -677,5 +751,63 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().show(ui, |ui| self.match_view(ui));
         self.show_overlay(ui.ctx());
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+
+    fn app() -> App {
+        let (_, events) = mpsc::channel();
+        let (commands, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, hotkeys) = mpsc::channel();
+        App {
+            events,
+            commands,
+            config: Config::default(),
+            key_input: String::new(),
+            lookup_input: String::new(),
+            status: Status::AgentSelect,
+            notice: None,
+            local_notice: None,
+            assets: None,
+            roster: None,
+            players: HashMap::new(),
+            lookup: None,
+            icons: HashMap::new(),
+            icons_requested: HashSet::new(),
+            hotkeys,
+            overlay: OverlayState::default(),
+            details: None,
+            depth: Depth::Last10,
+            quota: None,
+        }
+    }
+
+    #[test]
+    fn leaving_roster_closes_old_match_details_but_preserves_manual_lookup() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.roster = Some(Roster {
+            match_id: "old".into(),
+            ffa: false,
+            slots: vec![Slot {
+                puuid: "old-player".into(),
+                side: Side::Ally,
+                agent: None,
+                locked: false,
+                hidden: false,
+                is_self: false,
+            }],
+        });
+        app.details = Some("old-player".into());
+        app.apply(&ctx, Event::Roster(None));
+        assert!(app.details.is_none());
+
+        app.lookup = Some(Lookup::Resolved("searched-player".into()));
+        app.details = Some("searched-player".into());
+        app.apply(&ctx, Event::Roster(None));
+        assert_eq!(app.details.as_deref(), Some("searched-player"));
     }
 }

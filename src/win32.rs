@@ -76,7 +76,8 @@ mod imp {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowW, GWL_EXSTYLE, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, MSG,
-        SM_CXSCREEN, SM_CYSCREEN, SetWindowLongPtrW, WM_HOTKEY, WS_EX_NOACTIVATE,
+        SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
+        WM_HOTKEY, WS_EX_NOACTIVATE,
     };
 
     use super::{Hotkey, parse_hotkey};
@@ -154,6 +155,24 @@ mod imp {
         }
     }
 
+    /// Put the undecorated overlay on the primary display in native pixels, independently of
+    /// the main window's DPI or location on another monitor. Primary origin is always (0, 0).
+    pub fn cover_primary_monitor(hwnd: isize) {
+        if let Some([w, h]) = primary_monitor_px() {
+            unsafe {
+                SetWindowPos(
+                    hwnd as HWND,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+        }
+    }
+
     /// Restricts painting and hit-testing to `rects` (client pixels: x0, y0, x1, y1). Clicks outside
     /// fall through to the game. `None` restores the full window.
     pub fn set_region(hwnd: isize, rects: Option<&[[i32; 4]]>) {
@@ -195,6 +214,7 @@ mod imp {
         None
     }
     pub fn set_no_activate(_: isize) {}
+    pub fn cover_primary_monitor(_: isize) {}
     pub fn set_region(_: isize, _: Option<&[[i32; 4]]>) {}
 }
 

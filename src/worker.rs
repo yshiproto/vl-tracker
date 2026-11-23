@@ -3,6 +3,7 @@
 //! Polling cadence:
 //! * no Riot Client: check the lockfile every 5s
 //! * menus / agent select: local presence every 4s (GLZ only while in agent select)
+//! * loading: local log every second, presence every 4s
 //! * in a loaded match: local presence every 15s, no remote calls until it ends
 //!
 //! The UI is only woken when something it displays changes.
@@ -123,6 +124,8 @@ struct Worker {
     notices: BTreeMap<NoticeSource, String>,
     roster: Option<Roster>,
     roster_is_core: bool,
+    /// Ignore the preceding match while GLZ catches up to a newly observed agent select.
+    previous_core_id: Option<String>,
     named: HashSet<String>,
     lookup_query: Option<String>,
     lookup_target: Option<(String, String)>,
@@ -131,10 +134,14 @@ struct Worker {
     in_flight: HashSet<String>,
     tasks: JoinSet<TaskDone>,
     round_start_markers: Vec<String>,
-    /// Armed during agent select at the log's end, so the loading screen's lines can be followed.
+    /// Armed once on entering agent select, so a delayed core roster cannot skip round start.
     log_tail: Option<LogTail>,
     /// Set while the loading screen is up.
     loading: Option<(LogTail, Instant)>,
+    /// The log is checked every second without requesting local presence each time.
+    next_presence_at: Instant,
+    /// Ignore a single transient MENUS presence while changing phases.
+    menu_observations: u8,
 }
 
 impl Worker {
@@ -164,6 +171,7 @@ impl Worker {
             notices: BTreeMap::new(),
             roster: None,
             roster_is_core: false,
+            previous_core_id: None,
             named: HashSet::new(),
             lookup_query: None,
             lookup_target: None,
@@ -174,6 +182,8 @@ impl Worker {
             round_start_markers,
             log_tail: None,
             loading: None,
+            next_presence_at: Instant::now(),
+            menu_observations: 0,
         })
     }
 
@@ -267,13 +277,25 @@ impl Worker {
     }
 
     async fn tick(&mut self) -> Duration {
-        if self.assets.is_none() && Instant::now() >= self.assets_retry_at {
+        // The round-start marker can arrive between presence polls (or during a slow GLZ
+        // request). Follow the local log independently so the overlay disappears promptly.
+        if self.loading.is_some() {
+            if self.poll_loading() == MATCH_POLL {
+                return MATCH_POLL;
+            }
+            if Instant::now() < self.next_presence_at {
+                return LOADING_POLL;
+            }
+        }
+        if self.loading.is_none() && self.assets.is_none() && Instant::now() >= self.assets_retry_at
+        {
             self.load_assets().await;
         }
-
         let Some(session) = self.ensure_session().await else {
             self.set_status(Status::WaitingForClient);
             self.set_roster(None, false);
+            self.log_tail = None;
+            self.menu_observations = 0;
             return IDLE_POLL;
         };
 
@@ -284,40 +306,50 @@ impl Worker {
                 self.session = None;
                 self.set_status(Status::WaitingForClient);
                 self.set_roster(None, false);
+                self.log_tail = None;
+                self.menu_observations = 0;
                 return IDLE_POLL;
             }
         };
+        self.next_presence_at = Instant::now() + MENU_POLL;
+        if state != LoopState::Menus {
+            self.menu_observations = 0;
+        }
 
         let result = match state {
             LoopState::Menus => {
-                self.set_status(Status::InMenu);
-                self.set_roster(None, false);
-                self.log_tail = None;
+                self.menu_observations = self.menu_observations.saturating_add(1);
+                if self.roster.is_none() || self.menu_observations >= 2 {
+                    self.set_status(Status::InMenu);
+                    self.set_roster(None, false);
+                    self.log_tail = None;
+                }
                 Ok(MENU_POLL)
             }
+            LoopState::Pregame if self.roster_is_core && self.loading.is_some() => Ok(LOADING_POLL),
             LoopState::Pregame => match self.poll_pregame(&session).await {
-                // Presence and GLZ briefly disagree around phase transitions.
-                Ok(false) => {
-                    self.set_roster(None, false);
-                    Ok(MENU_POLL)
+                Ok(false) if !self.roster_is_core && self.roster.is_some() => {
+                    // GLZ can remove pregame before it publishes core-game. Keep the old
+                    // layout while probing for the new roster.
+                    self.poll_core(&session).await.map(|_| MENU_POLL)
                 }
+                Ok(false) => Ok(MENU_POLL),
                 r => r.map(|_| MENU_POLL),
             },
-            // Roster loaded: presence leaving INGAME is what ends the match, no remote calls
-            // beyond following the log while the loading screen is up.
             LoopState::InGame if self.roster_is_core && self.roster.is_some() => {
-                Ok(self.poll_loading())
+                Ok(if self.loading.is_some() {
+                    LOADING_POLL
+                } else {
+                    MATCH_POLL
+                })
             }
             LoopState::InGame => match self.poll_core(&session).await {
-                Ok(false) => {
-                    self.set_roster(None, false);
-                    Ok(MENU_POLL)
-                }
+                Ok(false) => Ok(MENU_POLL),
                 r => r.map(|_| self.poll_loading()),
             },
             LoopState::Unknown => self.poll_unknown(&session).await,
         };
-        match result {
+        let delay = match result {
             Ok(delay) => {
                 self.set_notice(NoticeSource::Riot, None);
                 self.schedule_roster(); // retries transient failures; no-op otherwise
@@ -327,6 +359,11 @@ impl Worker {
                 self.set_notice(NoticeSource::Riot, Some(format!("Riot servers: {e}")));
                 MENU_POLL
             }
+        };
+        if self.loading.is_some() {
+            LOADING_POLL
+        } else {
+            delay
         }
     }
 
@@ -364,11 +401,29 @@ impl Worker {
         let Some(id) = session.pregame_match_id().await? else {
             return Ok(false);
         };
-        // Re-read every tick: hovered/locked agents change during selection.
-        let roster = session.pregame_roster(&id).await?;
+        if self.roster_is_core && self.roster.as_ref().is_some_and(|r| r.match_id == id) {
+            return Ok(false); // stale pregame presence for the current core match
+        }
+        // Arm before a slow roster request; its latency can span the first buy-phase line.
+        if self.roster_is_core
+            || self.roster.as_ref().is_some_and(|r| r.match_id != id)
+            || self.log_tail.is_none()
+        {
+            self.log_tail = LogTail::game_log_at_end();
+        }
+        // Re-read every tick: hovered/locked agents change during selection. The match
+        // can disappear between the ID and roster requests while transitioning to core.
+        let roster = match session.pregame_roster(&id).await {
+            Ok(roster) => roster,
+            Err(Error::NotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if self.roster_is_core {
+            self.previous_core_id = self.roster.as_ref().map(|r| r.match_id.clone());
+        }
+        self.loading = None;
         self.set_status(Status::AgentSelect);
         self.apply_roster(session, roster, false).await;
-        self.log_tail = LogTail::game_log_at_end();
         Ok(true)
     }
 
@@ -377,10 +432,18 @@ impl Worker {
         let Some(id) = session.core_match_id().await? else {
             return Ok(false);
         };
+        if self.previous_core_id.as_deref() == Some(id.as_str()) {
+            return Ok(false);
+        }
         let known = self.roster_is_core && self.roster.as_ref().is_some_and(|r| r.match_id == id);
         if !known {
-            let roster = session.core_roster(&id).await?;
+            let roster = match session.core_roster(&id).await {
+                Ok(roster) => roster,
+                Err(Error::NotFound) => return Ok(false),
+                Err(e) => return Err(e),
+            };
             self.apply_roster(session, roster, true).await;
+            self.previous_core_id = None;
             // Only a match entered from agent select has a loading screen we watched start.
             self.loading = self.log_tail.take().map(|tail| (tail, Instant::now()));
         }
@@ -405,16 +468,24 @@ impl Worker {
         MATCH_POLL
     }
 
-    /// Presence was unreadable: ask GLZ directly, the way the original plan polled.
+    /// Presence was unreadable: ask GLZ directly unless an in-game roster is already known.
     async fn poll_unknown(&mut self, session: &RiotSession) -> Result<Duration> {
+        if self.roster_is_core && self.roster.is_some() {
+            return Ok(if self.loading.is_some() {
+                LOADING_POLL
+            } else {
+                MATCH_POLL
+            });
+        }
         if self.poll_core(session).await? {
             return Ok(self.poll_loading());
         }
         if self.poll_pregame(session).await? {
             return Ok(MENU_POLL);
         }
-        self.set_status(Status::InMenu);
-        self.set_roster(None, false);
+        if self.roster.is_none() {
+            self.set_status(Status::InMenu);
+        }
         Ok(MENU_POLL)
     }
 
@@ -564,6 +635,7 @@ impl Worker {
         self.roster_is_core = is_core;
         if roster.is_none() {
             self.loading = None;
+            self.previous_core_id = None;
         }
         if self.roster != roster {
             self.roster = roster.clone();
@@ -691,12 +763,16 @@ impl PlayerJob {
         let mut page = match self.fetch_page(0, target0).await {
             Page::Ok(page) => page,
             Page::Failed { transient, reason } => {
-                if matches.is_empty() {
-                    self.unavailable(target0, &reason);
-                } else {
-                    // Unverified cached prefix: show it, capped at the depth it covers.
+                if transient && !matches.is_empty() {
+                    // Keep the cached partial rating while a later tick retries the failed page.
                     let depth = staged_depth(matches.len() as u32, exhausted).min(target0);
                     self.publish(&matches, depth, &act, false, exhausted);
+                    self.ui.send(Event::ImpactProgress {
+                        puuid: self.puuid.clone(),
+                        progress: Progress::Done,
+                    });
+                } else {
+                    self.unavailable(target0, &reason);
                 }
                 return transient;
             }
@@ -742,7 +818,18 @@ impl PlayerJob {
             }
             page = match self.fetch_page(start, target).await {
                 Page::Ok(page) => page,
-                Page::Failed { transient, .. } => return transient,
+                Page::Failed { transient, reason } => {
+                    if transient {
+                        // The latest verified prefix remains useful; task_done will retry.
+                        self.ui.send(Event::ImpactProgress {
+                            puuid: self.puuid.clone(),
+                            progress: Progress::Done,
+                        });
+                    } else {
+                        self.unavailable(target, &reason);
+                    }
+                    return transient;
+                }
             };
             let page_len = page.len() as u32;
             {
@@ -965,5 +1052,50 @@ mod tests {
         for d in [Depth::Last10, Depth::Last20, Depth::Act] {
             assert_eq!(depth_from_u8(depth_to_u8(d)), d);
         }
+    }
+    #[test]
+    fn loading_overlay_hides_on_first_new_round_marker() {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "vltracker-loading-{}-{nonce}.log",
+            std::process::id()
+        ));
+        std::fs::write(&path, "Gameplay started at local time (previous match)\n").unwrap();
+        let tail = LogTail::at_end(path.clone()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            UiSink::new(tx, egui::Context::default()),
+            String::new(),
+            vec!["Gameplay started at local time".into()],
+        )
+        .unwrap();
+        worker.status = Some(Status::Loading);
+        worker.loading = Some((tail, Instant::now()));
+        assert_eq!(worker.poll_loading(), LOADING_POLL);
+        assert!(
+            rx.try_recv().is_err(),
+            "old log lines must not hide the overlay"
+        );
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        log.write_all(b"Gameplay started at local time (first buy phase)\n")
+            .unwrap();
+        assert_eq!(worker.poll_loading(), MATCH_POLL);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::Status(Status::LiveMatch))
+        ));
+        assert!(worker.loading.is_none());
+        std::fs::remove_file(path).unwrap();
     }
 }

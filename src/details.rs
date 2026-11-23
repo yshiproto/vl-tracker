@@ -49,9 +49,11 @@ fn row(label: &'static str, value: String, hint: &'static str) -> Row {
 }
 
 fn rows_grid(ui: &mut egui::Ui, id: &str, rows: &[Row]) {
+    const LABEL_WIDTH: f32 = 116.0;
+    const VALUE_WIDTH: f32 = CARD_WIDTH - LABEL_WIDTH - 8.0;
     egui::Grid::new(id)
         .num_columns(2)
-        .spacing([14.0, 3.0])
+        .spacing([8.0, 3.0])
         .show(ui, |ui| {
             for r in rows {
                 let label = RichText::new(r.label).color(Color32::from_gray(if r.lead {
@@ -65,11 +67,13 @@ fn rows_grid(ui: &mut egui::Ui, id: &str, rows: &[Row]) {
                 } else {
                     (label, value)
                 };
-                let l = ui.label(label);
-                let v = ui.label(value);
+                let label = ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new(label).truncate());
+                let value = ui.add_sized([VALUE_WIDTH, 18.0], egui::Label::new(value).truncate());
                 if !r.hint.is_empty() {
-                    l.on_hover_text(r.hint);
-                    v.on_hover_text(r.hint);
+                    label.on_hover_text(r.hint);
+                    value.on_hover_text(format!("{}\n\n{}", r.value, r.hint));
+                } else {
+                    value.on_hover_text(&r.value);
                 }
                 ui.end_row();
             }
@@ -87,6 +91,7 @@ impl App {
             impact,
             impact_depth,
             progress,
+            progress_at,
         }) = self.players.get(puuid).cloned()
         else {
             ui.label(RichText::new("No data for this player yet").weak());
@@ -98,10 +103,12 @@ impl App {
         self.rank_section(ui, &rank);
 
         match &impact {
-            Fetch::Ready(i) => self.impact_section(ui, i, impact_depth, progress.as_ref()),
+            Fetch::Ready(i) => {
+                self.impact_section(ui, i, impact_depth, progress.as_ref(), progress_at)
+            }
             Fetch::Pending => {
                 section(ui, "IMPACT");
-                ui.label(RichText::new(progress_text(progress.as_ref(), 0)).weak());
+                ui.label(RichText::new(progress_text(progress.as_ref(), progress_at)).weak());
             }
             Fetch::Unavailable(reason) => {
                 section(ui, "IMPACT");
@@ -134,6 +141,7 @@ impl App {
         i: &Impact,
         depth: Depth,
         progress: Option<&Progress>,
+        progress_at: Option<std::time::Instant>,
     ) {
         let scope = format!(
             "{} MATCHES",
@@ -175,7 +183,7 @@ impl App {
         );
         if !matches!(progress, None | Some(Progress::Done)) {
             ui.label(
-                RichText::new(progress_text(progress, i.matches))
+                RichText::new(progress_text(progress, progress_at))
                     .small()
                     .color(Color32::from_rgb(230, 170, 90)),
             );
@@ -459,12 +467,11 @@ impl App {
 }
 
 /// One line describing where a player's deep fetch stands.
-fn progress_text(progress: Option<&Progress>, have_now: u32) -> String {
+fn progress_text(progress: Option<&Progress>, at: Option<std::time::Instant>) -> String {
     match progress {
         None => "Queued for match history…".into(),
         Some(Progress::Done) => String::new(),
         Some(Progress::Fetching { have, target }) => {
-            let have = (*have).max(have_now);
             format!(
                 "Fetching match history… {have} so far, target: {}",
                 target.label().to_lowercase()
@@ -475,9 +482,10 @@ fn progress_text(progress: Option<&Progress>, have_now: u32) -> String {
             target,
             resume_secs,
         }) => {
-            let have = (*have).max(have_now);
+            let remaining =
+                resume_secs.saturating_sub(at.map_or(0, |at| at.elapsed().as_secs() as u32));
             format!(
-                "Waiting {resume_secs}s for API quota ({have} so far, target: {})",
+                "Waiting {remaining}s for API quota ({have} so far, target: {})",
                 target.label().to_lowercase()
             )
         }
@@ -615,5 +623,29 @@ fn impact_note(i: &Impact) -> Option<&'static str> {
         Some("Many kills come after the round is decided or against weaker buys.")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn quota_wait_counts_down_from_last_worker_update() {
+        let progress = Progress::RateLimited {
+            have: 10,
+            target: Depth::Last20,
+            resume_secs: 30,
+        };
+        let at = Instant::now() - Duration::from_secs(5);
+        assert!(
+            progress_text(Some(&progress), Some(at))
+                .starts_with("Waiting 25s for API quota (10 so far")
+        );
+        let expired = Instant::now() - Duration::from_secs(31);
+        assert!(
+            progress_text(Some(&progress), Some(expired)).starts_with("Waiting 0s for API quota")
+        );
     }
 }

@@ -21,8 +21,8 @@ use crate::{App, Columns, PlayerInfo, impact_label};
 
 /// Loading-screen box: fits inside a player's 405×114 banner.
 const LOADING_BOX: Vec2 = Vec2::new(250.0, 58.0);
-/// Agent-select box: one 126 px card wide, fits the strip under the card row.
-const AGENT_BOX: Vec2 = Vec2::new(126.0, 36.0);
+/// Agent-select box: one 126 px card wide, with room for both lines and the frame.
+const AGENT_BOX: Vec2 = Vec2::new(126.0, 44.0);
 const BADGE: f32 = 24.0;
 const INTERACTIVE_TITLE: &str = "vltracker overlay (interactive)";
 const PASSTHROUGH_TITLE: &str = "vltracker overlay";
@@ -64,6 +64,10 @@ pub struct OverlayState {
 }
 
 impl OverlayState {
+    pub(crate) fn is_calibrating(&self) -> bool {
+        self.calibrating.is_some()
+    }
+
     /// Agent select and the loading screen show the overlay click-through; anything else hides it.
     pub fn on_status(&mut self, status: Status) {
         self.visibility = match status {
@@ -102,10 +106,10 @@ fn panel_frame() -> egui::Frame {
 }
 
 /// Player boxes get an accent border while clickable.
-fn box_frame(layout: Layout, clickable: bool) -> egui::Frame {
+fn box_frame(layout: Layout, clickable: bool, scale: f32) -> egui::Frame {
     let frame = match layout {
-        Layout::AgentSelect => panel_frame().inner_margin(4.0).corner_radius(4.0),
-        Layout::Loading => panel_frame(),
+        Layout::AgentSelect => panel_frame().inner_margin(4.0 * scale).corner_radius(4.0),
+        Layout::Loading => panel_frame().inner_margin(8.0 * scale),
     };
     if clickable {
         frame.stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.7)))
@@ -178,11 +182,13 @@ impl App {
         // flags change, so the click-through setting is fixed at creation instead of toggled.
         let id = ViewportId::from_hash_of(title);
 
-        let ppp = ctx
+        // The main window can be on another monitor, with a different DPI. Its scale only
+        // bootstraps the viewport builder; all drawing below uses the overlay's own viewport.
+        let main_ppp = ctx
             .input(|i| i.viewport().native_pixels_per_point)
             .unwrap_or(1.0);
-        let screen = win32::primary_monitor_px()
-            .map(|[w, h]| Vec2::new(w, h) / ppp)
+        let requested_size = win32::primary_monitor_px()
+            .map(|[w, h]| Vec2::new(w, h) / main_ppp)
             .or_else(|| ctx.input(|i| i.viewport().monitor_size))
             .unwrap_or(Vec2::new(1920.0, 1080.0));
 
@@ -195,18 +201,20 @@ impl App {
             .with_active(false)
             .with_window_level(egui::WindowLevel::AlwaysOnTop)
             .with_position(Pos2::ZERO)
-            .with_inner_size(screen)
+            .with_inner_size(requested_size)
             .with_mouse_passthrough(!interactive);
 
         ctx.show_viewport_immediate(id, builder, |ui, _| {
-            self.style_overlay_window(ui.ctx(), id, title, interactive);
+            let ctx = ui.ctx();
+            self.style_overlay_window(ctx, id, title, interactive);
+            let screen = ctx.viewport_rect().size();
             let rects = match mode {
                 Mode::Calibrate(layout) => {
-                    self.draw_calibration(ui.ctx(), layout, screen);
+                    self.draw_calibration(ctx, layout, screen);
                     None
                 }
-                Mode::Boxes(layout) => Some(self.draw_boxes(ui.ctx(), layout, screen, interactive)),
-                Mode::Scoreboard => Some(vec![self.draw_scoreboard(ui.ctx())]),
+                Mode::Boxes(layout) => Some(self.draw_boxes(ctx, layout, screen, interactive)),
+                Mode::Scoreboard => Some(vec![self.draw_scoreboard(ctx)]),
             };
             let rects = rects.map(|mut rects| {
                 if interactive {
@@ -233,6 +241,8 @@ impl App {
                 if interactive {
                     win32::set_no_activate(hwnd);
                 }
+                win32::cover_primary_monitor(hwnd);
+                ctx.request_repaint();
                 self.overlay.window = Some((id, hwnd));
                 self.overlay.region = None;
             }
@@ -248,14 +258,15 @@ impl App {
             return;
         };
         let ppp = ctx.pixels_per_point();
+        let origin = ctx.viewport_rect().min;
         let px = rects.map(|rects| {
             rects
                 .iter()
                 .map(|r| {
-                    let r = r.expand(2.0);
+                    let r = r.expand(2.0).translate(-origin.to_vec2());
                     [
-                        (r.min.x * ppp) as i32,
-                        (r.min.y * ppp) as i32,
+                        (r.min.x * ppp).floor() as i32,
+                        (r.min.y * ppp).floor() as i32,
                         (r.max.x * ppp).ceil() as i32,
                         (r.max.y * ppp).ceil() as i32,
                     ]
@@ -327,9 +338,16 @@ impl App {
         let mut open = None;
         for (g, (slots, anchors)) in groups.into_iter().enumerate() {
             for (i, (slot, anchor)) in slots.iter().zip(&anchors).enumerate() {
+                let scale = canvas(screen).1;
                 let resp =
                     egui::Area::new(Id::unique(("overlay_box", layout == Layout::Loading, g, i)))
-                        .current_pos(to_screen(*anchor, screen))
+                        .current_pos(visible_anchor(
+                            to_screen(*anchor, screen),
+                            box_size(layout) * scale,
+                            screen,
+                            Align2::LEFT_TOP,
+                        ))
+                        .movable(false)
                         .interactable(clickable)
                         .sense(if clickable {
                             Sense::click()
@@ -337,10 +355,12 @@ impl App {
                             Sense::hover()
                         })
                         .order(egui::Order::Foreground)
+                        .constrain_to(ctx.viewport_rect())
                         .show(ctx, |ui| {
-                            box_frame(layout, clickable).show(ui, |ui| match layout {
-                                Layout::AgentSelect => self.compact_box(ui, slot),
-                                Layout::Loading => self.stat_box(ui, slot),
+                            scale_text(ui, scale);
+                            box_frame(layout, clickable, scale).show(ui, |ui| match layout {
+                                Layout::AgentSelect => self.compact_box(ui, slot, scale),
+                                Layout::Loading => self.stat_box(ui, slot, scale),
                             })
                         });
                 let rect = resp.response.rect;
@@ -365,7 +385,7 @@ impl App {
             let (pos, pivot) = match layout {
                 Layout::AgentSelect => (card_anchor, Align2::LEFT_BOTTOM),
                 // Open toward the centre of the screen, beside the box.
-                Layout::Loading if rect.center().x < screen.x / 2.0 => {
+                Layout::Loading if rect.center().x < ctx.viewport_rect().center().x => {
                     (rect.right_top() + Vec2::new(8.0, 0.0), Align2::LEFT_TOP)
                 }
                 Layout::Loading => (rect.left_top() - Vec2::new(8.0, 0.0), Align2::RIGHT_TOP),
@@ -451,7 +471,7 @@ impl App {
                 });
             });
 
-        let size = box_size(layout);
+        let size = box_size(layout) * canvas(screen).1;
         let cfg = &mut self.config.overlay;
         let groups: Vec<(&str, &mut Vec<[f32; 2]>)> = match layout {
             Layout::AgentSelect => vec![("Teammate", &mut cfg.agent_select)],
@@ -475,7 +495,7 @@ impl App {
             }
         }
         if layout == Layout::AgentSelect {
-            let size = Vec2::new(CARD_WIDTH, 160.0);
+            let size = Vec2::new(CARD_WIDTH + 16.0, 160.0);
             let anchor = &mut cfg.agent_select_card;
             drag_placeholder(
                 ctx,
@@ -490,10 +510,10 @@ impl App {
     }
 
     /// Two-line box for the strip under an agent-select card: name and impact, then rank.
-    fn compact_box(&mut self, ui: &mut egui::Ui, slot: &Slot) {
-        ui.set_min_size(AGENT_BOX - Vec2::splat(8.0));
-        ui.set_max_width(AGENT_BOX.x - 8.0);
-        ui.spacing_mut().item_spacing = Vec2::new(4.0, 1.0);
+    fn compact_box(&mut self, ui: &mut egui::Ui, slot: &Slot, scale: f32) {
+        ui.set_min_size((AGENT_BOX - Vec2::splat(8.0)) * scale);
+        ui.set_max_width((AGENT_BOX.x - 8.0) * scale);
+        ui.spacing_mut().item_spacing = Vec2::new(4.0, 1.0) * scale;
         if slot.hidden {
             ui.label(RichText::new("Hidden player").small().italics().weak());
             return;
@@ -520,9 +540,9 @@ impl App {
     }
 
     /// Compact per-player box: rank badge, name, rank, and headline stats.
-    fn stat_box(&mut self, ui: &mut egui::Ui, slot: &Slot) {
-        ui.set_min_size(LOADING_BOX - Vec2::splat(16.0));
-        ui.set_max_width(LOADING_BOX.x - 16.0);
+    fn stat_box(&mut self, ui: &mut egui::Ui, slot: &Slot, scale: f32) {
+        ui.set_min_size((LOADING_BOX - Vec2::splat(16.0)) * scale);
+        ui.set_max_width((LOADING_BOX.x - 16.0) * scale);
         if slot.hidden {
             ui.label(RichText::new("Hidden player").italics().weak());
             ui.label(RichText::new("profile not looked up").small().weak());
@@ -539,9 +559,12 @@ impl App {
             match badge {
                 Some(tex) => ui.add(egui::Image::new(egui::load::SizedTexture::new(
                     tex,
-                    Vec2::splat(BADGE),
+                    Vec2::splat(BADGE * scale),
                 ))),
-                None => ui.allocate_exact_size(Vec2::splat(BADGE), Sense::hover()).1,
+                None => {
+                    ui.allocate_exact_size(Vec2::splat(BADGE * scale), Sense::hover())
+                        .1
+                }
             };
             ui.vertical(|ui| {
                 // Long names truncate instead of widening the box past the banner.
@@ -551,7 +574,7 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = 4.0 * scale;
             match info.map(|p| &p.impact) {
                 Some(Fetch::Ready(i)) => {
                     let (_, color) = impact_label(i.rating);
@@ -639,8 +662,55 @@ fn stats_line(info: Option<&PlayerInfo>) -> String {
     }
 }
 
+/// Map reference-screen fractions into a centred 16:9 game canvas. On 16:10 and ultrawide
+/// monitors the extra space stays at the edges instead of stretching player-card spacing.
+fn canvas(screen: Vec2) -> (Pos2, f32) {
+    let scale = (screen.x / 1920.0).min(screen.y / 1080.0);
+    (
+        Pos2::new(
+            (screen.x - 1920.0 * scale) / 2.0,
+            (screen.y - 1080.0 * scale) / 2.0,
+        ),
+        scale,
+    )
+}
+
 fn to_screen(anchor: [f32; 2], screen: Vec2) -> Pos2 {
-    Pos2::new(anchor[0] * screen.x, anchor[1] * screen.y)
+    let (origin, scale) = canvas(screen);
+    origin + Vec2::new(anchor[0] * 1920.0 * scale, anchor[1] * 1080.0 * scale)
+}
+
+fn from_screen(pos: Pos2, screen: Vec2) -> [f32; 2] {
+    let (origin, scale) = canvas(screen);
+    [
+        (pos.x - origin.x) / (1920.0 * scale),
+        (pos.y - origin.y) / (1080.0 * scale),
+    ]
+}
+
+/// Keep the full rendered box visible, including when a calibrated anchor came from an older
+/// screen size. The pivot decides which edge is represented by the saved anchor.
+fn visible_anchor(pos: Pos2, size: Vec2, screen: Vec2, pivot: Align2) -> Pos2 {
+    let right = pivot == Align2::RIGHT_TOP || pivot == Align2::RIGHT_BOTTOM;
+    let bottom = pivot == Align2::LEFT_BOTTOM || pivot == Align2::RIGHT_BOTTOM;
+    Pos2::new(
+        pos.x.clamp(
+            if right { size.x.min(screen.x) } else { 0.0 },
+            if right {
+                screen.x
+            } else {
+                (screen.x - size.x).max(0.0)
+            },
+        ),
+        pos.y.clamp(
+            if bottom { size.y.min(screen.y) } else { 0.0 },
+            if bottom {
+                screen.y
+            } else {
+                (screen.y - size.y).max(0.0)
+            },
+        ),
+    )
 }
 
 /// Valorant draws the local player's card in the middle of the agent-select row.
@@ -648,6 +718,17 @@ fn move_self_to_middle(slots: &mut Vec<Slot>) {
     if let Some(i) = slots.iter().position(|s| s.is_self) {
         let me = slots.remove(i);
         slots.insert(slots.len() / 2, me);
+    }
+}
+
+/// Scale the box text with the game canvas, not with the main window's DPI. This keeps adjacent
+/// agent cards distinct at 720p and text aligned with their banners at 1440p and above.
+fn scale_text(ui: &mut egui::Ui, scale: f32) {
+    if scale != 1.0 {
+        for font in ui.style_mut().text_styles.values_mut() {
+            font.size *= scale;
+        }
+        ui.spacing_mut().item_spacing *= scale;
     }
 }
 
@@ -661,29 +742,31 @@ fn drag_placeholder(
     pivot: Align2,
     label: &str,
 ) {
+    let scale = canvas(screen).1;
+    let pos = visible_anchor(to_screen(*anchor, screen), size, screen, pivot);
     let resp = egui::Area::new(Id::unique(id))
-        .current_pos(to_screen(*anchor, screen))
+        .current_pos(pos)
         .pivot(pivot)
+        .movable(false)
         .sense(Sense::drag())
         .order(egui::Order::Foreground)
+        .constrain_to(ctx.viewport_rect())
         .show(ctx, |ui| {
+            scale_text(ui, scale);
             panel_frame()
-                .inner_margin(4.0)
+                .inner_margin(4.0 * scale)
                 .stroke(egui::Stroke::new(1.5, ACCENT))
                 .show(ui, |ui| {
-                    ui.set_min_size(size - Vec2::splat(8.0));
-                    ui.set_max_width(size.x - 8.0);
+                    ui.set_min_size(size - Vec2::splat(8.0 * scale));
+                    ui.set_max_width(size.x - 8.0 * scale);
                     ui.label(RichText::new(label).small().strong());
                     ui.label(RichText::new("drag").small().weak());
                 })
         });
     let delta = resp.response.drag_delta();
     if delta != Vec2::ZERO {
-        let pos = to_screen(*anchor, screen) + delta;
-        *anchor = [
-            (pos.x / screen.x).clamp(0.0, 1.0),
-            (pos.y / screen.y).clamp(0.0, 1.0),
-        ];
+        let pos = visible_anchor(pos + delta, resp.response.rect.size(), screen, pivot);
+        *anchor = from_screen(pos, screen);
     }
 }
 
@@ -754,5 +837,60 @@ mod tests {
         move_self_to_middle(&mut slots);
         let order: Vec<&str> = slots.iter().map(|s| s.puuid.as_str()).collect();
         assert_eq!(order, ["a", "b", "me", "c", "d"]);
+    }
+
+    #[test]
+    fn centred_game_canvas_and_drag_round_trip() {
+        let config = OverlayConfig::default();
+        for screen in [
+            Vec2::new(1920.0, 1080.0),
+            Vec2::new(1280.0, 720.0),
+            Vec2::new(1536.0, 864.0),
+            Vec2::new(1280.0, 800.0),
+            Vec2::new(1920.0, 1200.0),
+        ] {
+            let first = to_screen(config.agent_select[0], screen);
+            let last = to_screen(config.agent_select[4], screen);
+            let scale = canvas(screen).1;
+            assert!(first.x >= 0.0 && last.x + AGENT_BOX.x * scale <= screen.x);
+            assert!(last.y + AGENT_BOX.y * scale <= screen.y);
+            let ally = to_screen(config.loading_ally[0], screen);
+            let enemy = to_screen(config.loading_enemy[4], screen);
+            assert!(ally.x >= 0.0 && enemy.x + LOADING_BOX.x * scale <= screen.x);
+            assert!(enemy.y + LOADING_BOX.y * scale <= screen.y);
+            assert!(to_screen(config.agent_select[1], screen).x >= first.x + AGENT_BOX.x * scale);
+            assert!(to_screen(config.loading_ally[1], screen).y >= ally.y + LOADING_BOX.y * scale);
+            assert!((from_screen(first, screen)[0] - config.agent_select[0][0]).abs() < 0.00001);
+            assert!((from_screen(first, screen)[1] - config.agent_select[0][1]).abs() < 0.00001);
+        }
+        let screen = Vec2::new(1920.0, 1200.0);
+        assert_eq!(to_screen([0.0, 0.0], screen), Pos2::new(0.0, 60.0));
+        assert_eq!(
+            visible_anchor(
+                Pos2::new(1900.0, 1190.0),
+                AGENT_BOX,
+                screen,
+                Align2::LEFT_TOP
+            ),
+            Pos2::new(1794.0, 1156.0)
+        );
+        assert_eq!(
+            visible_anchor(
+                Pos2::new(10.0, 1190.0),
+                LOADING_BOX,
+                screen,
+                Align2::RIGHT_TOP
+            ),
+            Pos2::new(250.0, 1142.0)
+        );
+        assert_eq!(
+            visible_anchor(
+                Pos2::new(1900.0, 10.0),
+                AGENT_BOX,
+                screen,
+                Align2::LEFT_BOTTOM
+            ),
+            Pos2::new(1794.0, 44.0)
+        );
     }
 }
