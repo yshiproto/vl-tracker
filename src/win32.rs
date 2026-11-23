@@ -51,7 +51,10 @@ fn virtual_key(name: &str) -> Option<u32> {
     if let Some(n) = name.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()) {
         return (1..=24).contains(&n).then_some(0x70 + n - 1);
     }
-    if let Some(n) = name.strip_prefix("numpad").and_then(|n| n.parse::<u32>().ok()) {
+    if let Some(n) = name
+        .strip_prefix("numpad")
+        .and_then(|n| n.parse::<u32>().ok())
+    {
         return (n <= 9).then_some(0x60 + n);
     }
     match name.as_bytes() {
@@ -65,11 +68,16 @@ mod imp {
     use std::sync::mpsc;
 
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, RGN_OR, SetWindowRgn};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey};
+    use windows_sys::Win32::Graphics::Gdi::{
+        CombineRgn, CreateRectRgn, DeleteObject, RGN_OR, SetWindowRgn,
+    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GWL_EXSTYLE, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, MSG, SM_CXSCREEN, SM_CYSCREEN,
-        SetWindowLongPtrW, WM_HOTKEY, WS_EX_NOACTIVATE,
+        FindWindowW, GWL_EXSTYLE, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, MSG,
+        SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
+        WM_HOTKEY, WS_EX_NOACTIVATE,
     };
 
     use super::{Hotkey, parse_hotkey};
@@ -81,7 +89,10 @@ mod imp {
         calibrate: &str,
         on_press: impl Fn(Hotkey) + Send + 'static,
     ) -> Result<(), String> {
-        let keys = [(Hotkey::Toggle, toggle.to_owned()), (Hotkey::Calibrate, calibrate.to_owned())];
+        let keys = [
+            (Hotkey::Toggle, toggle.to_owned()),
+            (Hotkey::Calibrate, calibrate.to_owned()),
+        ];
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("vltracker-hotkeys".into())
@@ -90,8 +101,12 @@ mod imp {
                 for (id, (_, spec)) in keys.iter().enumerate() {
                     let ok = parse_hotkey(spec).is_some_and(|(mods, vk)| unsafe {
                         // Hotkeys bound to a null HWND post WM_HOTKEY to this thread's queue.
-                        RegisterHotKey(std::ptr::null_mut(), id as i32, mods as HOT_KEY_MODIFIERS | MOD_NOREPEAT, vk)
-                            != 0
+                        RegisterHotKey(
+                            std::ptr::null_mut(),
+                            id as i32,
+                            mods as HOT_KEY_MODIFIERS | MOD_NOREPEAT,
+                            vk,
+                        ) != 0
                     });
                     if !ok {
                         failed.push(spec.clone());
@@ -110,7 +125,10 @@ mod imp {
             .map_err(|e| format!("hotkey thread: {e}"))?;
         match ready_rx.recv() {
             Ok(failed) if failed.is_empty() => Ok(()),
-            Ok(failed) => Err(format!("could not register hotkey {} (invalid or used by another app)", failed.join(", "))),
+            Ok(failed) => Err(format!(
+                "could not register hotkey {} (invalid or used by another app)",
+                failed.join(", ")
+            )),
             Err(_) => Err("hotkey thread exited".into()),
         }
     }
@@ -134,6 +152,24 @@ mod imp {
         unsafe {
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE as isize);
+        }
+    }
+
+    /// Put the undecorated overlay on the primary display in native pixels, independently of
+    /// the main window's DPI or location on another monitor. Primary origin is always (0, 0).
+    pub fn cover_primary_monitor(hwnd: isize) {
+        if let Some([w, h]) = primary_monitor_px() {
+            unsafe {
+                SetWindowPos(
+                    hwnd as HWND,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
         }
     }
 
@@ -164,7 +200,11 @@ mod imp {
 mod imp {
     use super::Hotkey;
 
-    pub fn spawn_hotkeys(_: &str, _: &str, _: impl Fn(Hotkey) + Send + 'static) -> Result<(), String> {
+    pub fn spawn_hotkeys(
+        _: &str,
+        _: &str,
+        _: impl Fn(Hotkey) + Send + 'static,
+    ) -> Result<(), String> {
         Err("global hotkeys are only supported on Windows".into())
     }
     pub fn primary_monitor_px() -> Option<[f32; 2]> {
@@ -174,6 +214,7 @@ mod imp {
         None
     }
     pub fn set_no_activate(_: isize) {}
+    pub fn cover_primary_monitor(_: isize) {}
     pub fn set_region(_: isize, _: Option<&[[i32; 4]]>) {}
 }
 
@@ -187,7 +228,10 @@ mod tests {
     fn hotkey_specs() {
         assert_eq!(parse_hotkey("F8"), Some((0, 0x77)));
         assert_eq!(parse_hotkey("shift + f8"), Some((MOD_SHIFT, 0x77)));
-        assert_eq!(parse_hotkey("Ctrl+Alt+K"), Some((MOD_CONTROL | MOD_ALT, b'K' as u32)));
+        assert_eq!(
+            parse_hotkey("Ctrl+Alt+K"),
+            Some((MOD_CONTROL | MOD_ALT, b'K' as u32))
+        );
         assert_eq!(parse_hotkey("Insert"), Some((0, 0x2D)));
         assert_eq!(parse_hotkey("Numpad5"), Some((0, 0x65)));
         assert_eq!(parse_hotkey("F25"), None);

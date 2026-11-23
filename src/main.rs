@@ -23,7 +23,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Config;
 use crate::model::{
-    Command, Depth, Event, Fetch, IconKey, Impact, Progress, RankProfile, Roster, Side, Slot, Stats, Status,
+    Command, Depth, Event, Fetch, IconKey, Impact, Progress, RankProfile, Roster, Side, Slot,
+    Stats, Status,
 };
 use crate::overlay::OverlayState;
 use crate::val_assets::Assets;
@@ -42,7 +43,11 @@ fn main() -> eframe::Result {
             .with_min_inner_size([760.0, 360.0]),
         ..Default::default()
     };
-    eframe::run_native("vltracker", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
+    eframe::run_native(
+        "vltracker",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))),
+    )
 }
 
 #[derive(Default, Clone)]
@@ -54,6 +59,7 @@ struct PlayerInfo {
     /// Deepest level `impact` covers so far.
     impact_depth: Depth,
     progress: Option<Progress>,
+    progress_at: Option<std::time::Instant>,
 }
 
 enum Lookup {
@@ -92,22 +98,23 @@ struct App {
 impl App {
     fn new(ctx: &egui::Context) -> Self {
         let config = Config::load();
-        // The on-disk key wins; an env key only bootstraps a fresh config (used by the headless
-        // visual check on machines with no saved key).
-        let api_key = if config.henrik_api_key.is_empty() {
-            std::env::var("HENRIK_KEY").unwrap_or_default()
-        } else {
-            config.henrik_api_key.clone()
-        };
-        let (events, commands) =
-            worker::spawn(ctx.clone(), api_key.clone(), config.overlay.round_start_markers.clone());
+        let api_key = config.henrik_api_key.clone();
+        let (events, commands) = worker::spawn(
+            ctx.clone(),
+            api_key.clone(),
+            config.overlay.round_start_markers.clone(),
+        );
         let (hotkey_tx, hotkeys) = mpsc::channel();
         let repaint = ctx.clone();
-        let hotkey_error = win32::spawn_hotkeys(&config.overlay.hotkey, &config.overlay.calibrate_hotkey, move |key| {
-            if hotkey_tx.send(key).is_ok() {
-                repaint.request_repaint();
-            }
-        })
+        let hotkey_error = win32::spawn_hotkeys(
+            &config.overlay.hotkey,
+            &config.overlay.calibrate_hotkey,
+            move |key| {
+                if hotkey_tx.send(key).is_ok() {
+                    repaint.request_repaint();
+                }
+            },
+        )
         .err();
         Self {
             events,
@@ -139,19 +146,39 @@ impl App {
                 self.overlay.on_status(s);
             }
             Event::Assets(a) => self.assets = Some(a),
-            Event::Roster(r) => self.roster = r,
-            Event::Name { puuid, riot_id } => self.players.entry(puuid).or_default().riot_id = Some(riot_id),
+            Event::Roster(r) => {
+                if self.details.as_deref().is_some_and(|puuid| {
+                    !r.as_ref()
+                        .is_some_and(|roster| roster.slots.iter().any(|s| s.puuid == puuid))
+                        && !matches!(&self.lookup, Some(Lookup::Resolved(found)) if found == puuid)
+                }) {
+                    self.details = None;
+                }
+                self.roster = r;
+            }
+            Event::Name { puuid, riot_id } => {
+                self.players.entry(puuid).or_default().riot_id = Some(riot_id)
+            }
             Event::Rank { puuid, rank } => self.players.entry(puuid).or_default().rank = rank,
             Event::Stats { puuid, stats } => self.players.entry(puuid).or_default().stats = stats,
-            Event::Impact { puuid, depth, impact } => {
+            Event::Impact {
+                puuid,
+                depth,
+                impact,
+            } => {
                 let p = self.players.entry(puuid).or_default();
                 p.impact = impact;
                 p.impact_depth = depth;
             }
             Event::ImpactProgress { puuid, progress } => {
-                self.players.entry(puuid).or_default().progress = Some(progress);
+                let player = self.players.entry(puuid).or_default();
+                player.progress = Some(progress);
+                player.progress_at = Some(std::time::Instant::now());
             }
-            Event::Quota { remaining, reset_secs } => {
+            Event::Quota {
+                remaining,
+                reset_secs,
+            } => {
                 self.quota = Some((remaining, reset_secs, std::time::Instant::now()));
             }
             Event::Icon { key, image } => {
@@ -192,81 +219,143 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let (label, color) = match self.status {
+            Status::WaitingForClient => ("Waiting for Riot Client", Color32::GRAY),
+            Status::InMenu => ("In Menu", Color32::from_rgb(120, 170, 255)),
+            Status::AgentSelect => ("Agent Select", Color32::from_rgb(240, 200, 80)),
+            Status::Loading => ("Loading Screen", Color32::from_rgb(240, 200, 80)),
+            Status::LiveMatch => ("Live Match Detected", Color32::from_rgb(90, 210, 120)),
+        };
         ui.horizontal_wrapped(|ui| {
-            let (label, color) = match self.status {
-                Status::WaitingForClient => ("Waiting for Riot Client", Color32::GRAY),
-                Status::InMenu => ("In Menu", Color32::from_rgb(120, 170, 255)),
-                Status::AgentSelect => ("Agent Select", Color32::from_rgb(240, 200, 80)),
-                Status::Loading => ("Loading Screen", Color32::from_rgb(240, 200, 80)),
-                Status::LiveMatch => ("Live Match Detected", Color32::from_rgb(90, 210, 120)),
-            };
             let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter().circle_filled(dot.center(), 5.0, color);
             ui.label(RichText::new(label).strong());
-            ui.separator();
-
-            ui.label("HenrikDev key");
-            let key = ui.add(
-                egui::TextEdit::singleline(&mut self.key_input).password(true).hint_text("HDEV-…").desired_width(200.0),
-            );
-            let submitted = key.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let changed = self.key_input.trim() != self.config.henrik_api_key;
-            if (ui.add_enabled(changed, egui::Button::new("Save")).clicked() || submitted) && changed {
-                self.save_key();
+            if let Some((remaining, reset, at)) = self.quota {
+                ui.separator();
+                let remaining_time = reset.saturating_sub(at.elapsed().as_secs() as u32);
+                let (text, color) = if remaining_time == 0 {
+                    (
+                        "API quota · awaiting next response".to_owned(),
+                        Color32::from_gray(140),
+                    )
+                } else {
+                    let color = if remaining < 10 {
+                        Color32::from_rgb(230, 170, 90)
+                    } else {
+                        Color32::from_gray(140)
+                    };
+                    (
+                        format!("API quota {remaining} left · resets in {remaining_time}s"),
+                        color,
+                    )
+                };
+                ui.label(RichText::new(text).small().color(color))
+                    .on_hover_text(
+                        "HenrikDev free tier: 30 requests/min, including its own calls to Riot",
+                    );
             }
-            ui.separator();
-
-            ui.label("Lookup");
-            let lookup = ui.add(
-                egui::TextEdit::singleline(&mut self.lookup_input).hint_text("Name#Tag").desired_width(170.0),
-            );
-            let submitted = lookup.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("Search").clicked() || submitted {
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("HenrikDev key");
+                let key = ui.add(
+                    egui::TextEdit::singleline(&mut self.key_input).password(true).hint_text("HDEV-…").desired_width(180.0),
+                );
+                let submitted = key.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let changed = self.key_input.trim() != self.config.henrik_api_key;
+                if (ui.add_enabled(changed, egui::Button::new("Save")).clicked() || submitted) && changed {
+                    self.save_key();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Lookup");
+                let lookup = ui.add(
+                    egui::TextEdit::singleline(&mut self.lookup_input).hint_text("Name#Tag").desired_width(170.0),
+                );
+                let submitted = lookup.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let query = self.lookup_input.trim().to_owned();
-                if !query.is_empty() {
+                let pending = matches!(&self.lookup, Some(Lookup::Pending(q)) if q == &query);
+                if (ui.add_enabled(!query.is_empty() && !pending, egui::Button::new("Search")).clicked() || submitted)
+                    && !query.is_empty()
+                    && !pending
+                {
+                    if matches!(&self.lookup, Some(Lookup::Resolved(old)) if self.details.as_ref() == Some(old)) {
+                        self.details = None;
+                    }
                     self.lookup = Some(Lookup::Pending(query.clone()));
                     self.send(Command::Lookup(query));
                 }
-            }
-            ui.separator();
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
             ui.label("Impact over");
             let mut depth = self.depth;
-            egui::ComboBox::from_id_salt("depth").selected_text(depth.selector_label()).show_ui(ui, |ui| {
-                for d in [Depth::Last10, Depth::Last20, Depth::Act] {
-                    ui.selectable_value(&mut depth, d, d.selector_label());
-                }
-            });
+            egui::ComboBox::from_id_salt("depth")
+                .selected_text(depth.selector_label())
+                .show_ui(ui, |ui| {
+                    for d in [Depth::Last10, Depth::Last20, Depth::Act] {
+                        ui.selectable_value(&mut depth, d, d.selector_label());
+                    }
+                });
             if depth != self.depth {
                 self.depth = depth;
                 for player in self.players.values_mut() {
-                    player.progress = Some(Progress::Fetching { have: 0, target: depth });
+                    player.progress = Some(Progress::Fetching {
+                        have: 0,
+                        target: depth,
+                    });
+                    player.progress_at = Some(std::time::Instant::now());
                 }
                 self.send(Command::SetDepth(depth));
             }
             ui.separator();
-            let hint = format!(
-                "Overlay: {} toggle · {} calibrate",
-                self.config.overlay.hotkey, self.config.overlay.calibrate_hotkey
-            );
-            ui.label(RichText::new(hint).small().weak());
-            if let Some((remaining, reset, at)) = self.quota {
-                ui.separator();
-                let reset = reset.saturating_sub(at.elapsed().as_secs() as u32);
-                let text = format!("API quota {remaining} left · resets in {reset}s");
-                let color = if remaining < 10 { Color32::from_rgb(230, 170, 90) } else { Color32::from_gray(140) };
-                ui.label(RichText::new(text).small().color(color))
-                    .on_hover_text("HenrikDev free tier: 30 requests/min, including its own calls to Riot");
+            if ui
+                .add_enabled(
+                    self.roster.is_some(),
+                    egui::Button::new("Interact with overlay"),
+                )
+                .on_hover_text(format!(
+                    "Toggle click-through with {}",
+                    self.config.overlay.hotkey
+                ))
+                .clicked()
+            {
+                self.on_hotkey(Hotkey::Toggle);
+            }
+            let calibrating = self.overlay.is_calibrating();
+            if ui
+                .button(if calibrating {
+                    "Save calibration"
+                } else {
+                    "Calibrate overlay"
+                })
+                .on_hover_text(format!(
+                    "Drag boxes onto player cards · {}",
+                    self.config.overlay.calibrate_hotkey
+                ))
+                .clicked()
+            {
+                self.on_hotkey(Hotkey::Calibrate);
             }
         });
         for notice in [&self.local_notice, &self.notice].into_iter().flatten() {
-            ui.label(RichText::new(notice).small().color(Color32::from_rgb(230, 170, 90)));
+            ui.label(
+                RichText::new(notice)
+                    .small()
+                    .color(Color32::from_rgb(230, 170, 90)),
+            );
         }
     }
 
     fn save_key(&mut self) {
         let key = self.key_input.trim().to_owned();
-        self.config.henrik_api_key = key.clone();
-        self.save_config();
+        let previous = std::mem::replace(&mut self.config.henrik_api_key, key.clone());
+        if let Err(e) = self.config.save() {
+            self.config.henrik_api_key = previous;
+            self.local_notice = Some(format!("Could not save config: {e}"));
+            return;
+        }
+        self.local_notice = None;
         self.send(Command::SetApiKey(key));
     }
 
@@ -290,7 +379,10 @@ impl App {
                 ui.label(RichText::new(format!("Searching {q}…")).weak());
             }
             Some(Lookup::Failed { query, reason }) => {
-                ui.label(RichText::new(format!("{query}: {reason}")).color(Color32::from_rgb(230, 120, 110)));
+                ui.label(
+                    RichText::new(format!("{query}: {reason}"))
+                        .color(Color32::from_rgb(230, 120, 110)),
+                );
             }
             Some(Lookup::Resolved(puuid)) => {
                 let slot = Slot {
@@ -301,11 +393,25 @@ impl App {
                     hidden: false,
                     is_self: false,
                 };
-                self.player_grid(ui, "lookup_grid", &[slot], Columns::Main);
+                egui::ScrollArea::horizontal()
+                    .id_salt("lookup_scroll")
+                    .show(ui, |ui| {
+                        self.player_grid(ui, "lookup_grid", &[slot], Columns::Main);
+                    });
             }
             None => {}
         }
         if close {
+            if matches!(&self.lookup, Some(Lookup::Resolved(old)) if self.details.as_ref() == Some(old))
+                && self.details.as_deref().is_some_and(|puuid| {
+                    !self
+                        .roster
+                        .as_ref()
+                        .is_some_and(|r| r.slots.iter().any(|s| s.puuid == puuid))
+                })
+            {
+                self.details = None;
+            }
             self.lookup = None;
         }
     }
@@ -313,7 +419,9 @@ impl App {
     fn match_view(&mut self, ui: &mut egui::Ui) {
         let Some(roster) = &self.roster else {
             let msg = match self.status {
-                Status::WaitingForClient => "Start the Riot Client and log in. Matches are detected automatically.",
+                Status::WaitingForClient => {
+                    "Start the Riot Client and log in. Matches are detected automatically."
+                }
                 _ => "No active match. The lobby appears here when agent select starts.",
             };
             ui.centered_and_justified(|ui| ui.label(RichText::new(msg).weak()));
@@ -324,34 +432,46 @@ impl App {
         slots.sort_by_key(|s| !s.is_self);
         let ffa = roster.ffa;
         let pregame = self.status == Status::AgentSelect;
-        // Two team grids side by side need ~980 pt; with the details panel open they stack instead.
-        let side_by_side = ui.available_width() >= 980.0;
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            if ffa {
-                ui.heading("Players");
-                self.player_grid(ui, "ffa_grid", &slots, Columns::Main);
-                return;
-            }
-            let (allies, enemies): (Vec<Slot>, Vec<Slot>) = slots.into_iter().partition(|s| s.side == Side::Ally);
-            let team = |app: &mut Self, ui: &mut egui::Ui, title: &str, id: &str, slots: &[Slot]| {
-                ui.heading(title);
-                if slots.is_empty() && pregame {
-                    ui.label(RichText::new("Enemies are revealed once the match loads.").weak());
-                } else {
-                    app.player_grid(ui, id, slots, Columns::Main);
+        // Two ~480-point tables fit side by side at the default width; stack below that.
+        let side_by_side = ui.available_width() >= 1000.0;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if ffa {
+                    ui.heading("Players");
+                    egui::ScrollArea::horizontal()
+                        .id_salt("ffa_scroll")
+                        .show(ui, |ui| {
+                            self.player_grid(ui, "ffa_grid", &slots, Columns::Main);
+                        });
+                    return;
                 }
-            };
-            if side_by_side {
-                ui.columns(2, |cols| {
-                    team(self, &mut cols[0], "My Team", "ally_grid", &allies);
-                    team(self, &mut cols[1], "Enemy Team", "enemy_grid", &enemies);
-                });
-            } else {
-                team(self, ui, "My Team", "ally_grid", &allies);
-                ui.add_space(10.0);
-                team(self, ui, "Enemy Team", "enemy_grid", &enemies);
-            }
-        });
+                let (allies, enemies): (Vec<Slot>, Vec<Slot>) =
+                    slots.into_iter().partition(|s| s.side == Side::Ally);
+                let team =
+                    |app: &mut Self, ui: &mut egui::Ui, title: &str, id: &str, slots: &[Slot]| {
+                        ui.heading(title);
+                        if slots.is_empty() && pregame {
+                            ui.label(
+                                RichText::new("Enemies are revealed once the match loads.").weak(),
+                            );
+                        } else {
+                            egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+                                app.player_grid(ui, id, slots, Columns::Main);
+                            });
+                        }
+                    };
+                if side_by_side {
+                    ui.columns(2, |cols| {
+                        team(self, &mut cols[0], "My Team", "ally_grid", &allies);
+                        team(self, &mut cols[1], "Enemy Team", "enemy_grid", &enemies);
+                    });
+                } else {
+                    team(self, ui, "My Team", "ally_grid", &allies);
+                    ui.add_space(10.0);
+                    team(self, ui, "Enemy Team", "enemy_grid", &enemies);
+                }
+            });
     }
 
     fn player_grid(&mut self, ui: &mut egui::Ui, id: &str, slots: &[Slot], columns: Columns) {
@@ -359,47 +479,71 @@ impl App {
     }
 
     /// One grid so columns align across groups; a non-empty title adds a heading row before its group.
-    fn grouped_grid(&mut self, ui: &mut egui::Ui, id: &str, groups: &[(&str, &[Slot])], columns: Columns) {
+    fn grouped_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &str,
+        groups: &[(&str, &[Slot])],
+        columns: Columns,
+    ) {
         let headers: &[&str] = match columns {
             Columns::Main => &["", "", "Riot ID", "Rank", "Impact", "K/D", "HS%"],
             Columns::Scoreboard => &["", "", "Riot ID", "Rank", "K/D", "HS%", "WR", "ACS", "ADR"],
         };
-        egui::Grid::new(id).striped(true).num_columns(headers.len()).spacing([10.0, 4.0]).show(ui, |ui| {
-            for (title, slots) in groups {
-                if !title.is_empty() {
-                    // Title sits in the Riot ID column so the narrow icon columns keep their width.
-                    ui.label("");
-                    ui.label("");
-                    ui.label(RichText::new(*title).heading());
+        egui::Grid::new(id)
+            .striped(true)
+            .num_columns(headers.len())
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                for (title, slots) in groups {
+                    if !title.is_empty() {
+                        // Title sits in the Riot ID column so the narrow icon columns keep their width.
+                        ui.label("");
+                        ui.label("");
+                        ui.label(RichText::new(*title).heading());
+                        ui.end_row();
+                    }
+                    for h in headers {
+                        ui.label(RichText::new(*h).small().weak());
+                    }
                     ui.end_row();
+                    for slot in *slots {
+                        self.player_row(ui, slot, columns);
+                        ui.end_row();
+                    }
                 }
-                for h in headers {
-                    ui.label(RichText::new(*h).small().weak());
-                }
-                ui.end_row();
-                for slot in *slots {
-                    self.player_row(ui, slot, columns);
-                    ui.end_row();
-                }
-            }
-        });
+            });
     }
 
     fn player_row(&mut self, ui: &mut egui::Ui, slot: &Slot, columns: Columns) {
-        let agent_tex = slot.agent.clone().and_then(|a| self.icon(IconKey::Agent(a)));
-        let rank = self.players.get(&slot.puuid).map(|p| p.rank.clone()).unwrap_or_default();
+        let agent_tex = slot
+            .agent
+            .clone()
+            .and_then(|a| self.icon(IconKey::Agent(a)));
+        let rank = self
+            .players
+            .get(&slot.puuid)
+            .map(|p| p.rank.clone())
+            .unwrap_or_default();
         let rank_tex = match &rank {
             Fetch::Ready(r) => self.icon(IconKey::Rank(r.current.tier)),
             _ => None,
         };
 
         // Hovered-but-not-locked agents render dimmed during agent select.
-        let tint = if slot.locked { Color32::WHITE } else { Color32::from_white_alpha(90) };
+        let tint = if slot.locked {
+            Color32::WHITE
+        } else {
+            Color32::from_white_alpha(90)
+        };
         icon_cell(ui, agent_tex, tint);
         icon_cell(ui, rank_tex, Color32::WHITE);
 
         if slot.hidden {
-            let agent = slot.agent.as_deref().and_then(|a| self.assets.as_ref()?.agent_name(a));
+            let agent = slot
+                .agent
+                .as_deref()
+                .and_then(|a| self.assets.as_ref()?.agent_name(a));
             let text = match agent {
                 Some(name) => format!("Hidden ({name})"),
                 None => "Hidden".to_owned(),
@@ -430,12 +574,18 @@ impl App {
                 text = text.underline();
             }
             toggle_details = ui
-                .add(egui::Label::new(text).sense(egui::Sense::click()))
+                .add_sized(
+                    [170.0, 22.0],
+                    egui::Label::new(text)
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Show details")
+                .on_hover_text(format!("Show details: {name}"))
                 .clicked();
         } else {
-            ui.label(text);
+            ui.add_sized([170.0, 22.0], egui::Label::new(text).truncate())
+                .on_hover_text(name);
         }
 
         fetch_cell(ui, &rank, |_| self.rank_text(&rank));
@@ -455,7 +605,10 @@ impl App {
         ];
         if columns == Columns::Scoreboard {
             cells.push(fetch_cell(ui, &stats, |s| {
-                format!("{:.0}%", s.wins as f32 * 100.0 / (s.wins + s.losses).max(1) as f32)
+                format!(
+                    "{:.0}%",
+                    s.wins as f32 * 100.0 / (s.wins + s.losses).max(1) as f32
+                )
             }));
             cells.push(fetch_cell(ui, &stats, |s| format!("{:.0}", s.acs)));
             cells.push(fetch_cell(ui, &stats, |s| format!("{:.0}", s.adr)));
@@ -511,14 +664,23 @@ fn impact_cell(ui: &mut egui::Ui, impact: &Fetch<Impact>, depth: Depth) {
         Depth::Act => format!("{}+ act matches", i.matches),
         _ => format!("last {} competitive matches", i.matches),
     };
-    ui.label(RichText::new(format!("{:.2}", i.rating)).color(color).strong()).on_hover_text(format!(
+    ui.label(
+        RichText::new(format!("{:.2}", i.rating))
+            .color(color)
+            .strong(),
+    )
+    .on_hover_text(format!(
         "{label}: {:+.1}% round-win probability per round over {} rounds ({suffix})",
         i.wpa_per_round * 100.0,
         i.rounds
     ));
 }
 
-fn fetch_cell<T>(ui: &mut egui::Ui, value: &Fetch<T>, show: impl FnOnce(&T) -> String) -> egui::Response {
+fn fetch_cell<T>(
+    ui: &mut egui::Ui,
+    value: &Fetch<T>,
+    show: impl FnOnce(&T) -> String,
+) -> egui::Response {
     match value {
         Fetch::Pending => ui.label(RichText::new("…").weak()),
         Fetch::Ready(v) => ui.label(show(v)),
@@ -535,7 +697,14 @@ impl eframe::App for App {
         while let Ok(key) = self.hotkeys.try_recv() {
             self.on_hotkey(key);
         }
-        if self.quota.is_some() || self.players.values().any(|p| matches!(p.progress, Some(Progress::RateLimited { .. }))) {
+        if self
+            .quota
+            .is_some_and(|(_, reset, at)| at.elapsed().as_secs() < u64::from(reset))
+            || self
+                .players
+                .values()
+                .any(|p| matches!(p.progress, Some(Progress::RateLimited { .. })))
+        {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
@@ -560,22 +729,85 @@ impl eframe::App for App {
             });
         }
         if let Some(puuid) = self.details.clone() {
-            egui::Panel::right("details").resizable(false).exact_size(details::CARD_WIDTH + 30.0).show(ui, |ui| {
-                ui.add_space(4.0);
-                let mut close = false;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Player details").strong());
-                    if ui.small_button("×").on_hover_text("Close").clicked() {
-                        close = true;
+            egui::Panel::right("details")
+                .resizable(false)
+                .exact_size(details::CARD_WIDTH + 30.0)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    let mut close = false;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Player details").strong());
+                        if ui.small_button("×").on_hover_text("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| self.detail_card(ui, &puuid));
+                    if close {
+                        self.details = None;
                     }
                 });
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.detail_card(ui, &puuid));
-                if close {
-                    self.details = None;
-                }
-            });
         }
         egui::CentralPanel::default().show(ui, |ui| self.match_view(ui));
         self.show_overlay(ui.ctx());
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+
+    fn app() -> App {
+        let (_, events) = mpsc::channel();
+        let (commands, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, hotkeys) = mpsc::channel();
+        App {
+            events,
+            commands,
+            config: Config::default(),
+            key_input: String::new(),
+            lookup_input: String::new(),
+            status: Status::AgentSelect,
+            notice: None,
+            local_notice: None,
+            assets: None,
+            roster: None,
+            players: HashMap::new(),
+            lookup: None,
+            icons: HashMap::new(),
+            icons_requested: HashSet::new(),
+            hotkeys,
+            overlay: OverlayState::default(),
+            details: None,
+            depth: Depth::Last10,
+            quota: None,
+        }
+    }
+
+    #[test]
+    fn leaving_roster_closes_old_match_details_but_preserves_manual_lookup() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.roster = Some(Roster {
+            match_id: "old".into(),
+            ffa: false,
+            slots: vec![Slot {
+                puuid: "old-player".into(),
+                side: Side::Ally,
+                agent: None,
+                locked: false,
+                hidden: false,
+                is_self: false,
+            }],
+        });
+        app.details = Some("old-player".into());
+        app.apply(&ctx, Event::Roster(None));
+        assert!(app.details.is_none());
+
+        app.lookup = Some(Lookup::Resolved("searched-player".into()));
+        app.details = Some("searched-player".into());
+        app.apply(&ctx, Event::Roster(None));
+        assert_eq!(app.details.as_deref(), Some("searched-player"));
     }
 }

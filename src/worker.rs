@@ -3,6 +3,7 @@
 //! Polling cadence:
 //! * no Riot Client: check the lockfile every 5s
 //! * menus / agent select: local presence every 4s (GLZ only while in agent select)
+//! * loading: local log every second, presence every 4s
 //! * in a loaded match: local presence every 15s, no remote calls until it ends
 //!
 //! The UI is only woken when something it displays changes.
@@ -22,8 +23,10 @@ use tokio::time::{Instant, sleep_until};
 use crate::henrik_api::{Account, Henrik, IMPACT_PAGE};
 use crate::impact::{self, MatchDto, WinModel};
 use crate::match_cache::MatchCache;
-use crate::model::{Command, Depth, Error, Event, Fetch, IconKey, Progress, Result, Roster, Status, UiSink};
-use crate::riot_local::{LogTail, Lockfile, LoopState, RiotSession};
+use crate::model::{
+    Command, Depth, Error, Event, Fetch, IconKey, Progress, Result, Roster, Status, UiSink,
+};
+use crate::riot_local::{Lockfile, LogTail, LoopState, RiotSession};
 use crate::val_assets::{self, Assets};
 
 const IDLE_POLL: Duration = Duration::from_secs(5);
@@ -47,29 +50,50 @@ pub fn spawn(
     let (event_tx, event_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let ui = UiSink::new(event_tx, ctx);
-    let spawned = std::thread::Builder::new().name("vltracker-worker".into()).spawn({
-        let ui = ui.clone();
-        move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return ui.send(Event::Notice(Some(format!("Failed to start runtime: {e}")))),
-            };
-            match Worker::new(ui.clone(), api_key, round_start_markers) {
-                Ok(worker) => rt.block_on(worker.run(cmd_rx)),
-                Err(e) => ui.send(Event::Notice(Some(format!("Failed to start HTTP client: {e}")))),
+    let spawned = std::thread::Builder::new()
+        .name("vltracker-worker".into())
+        .spawn({
+            let ui = ui.clone();
+            move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        return ui
+                            .send(Event::Notice(Some(format!("Failed to start runtime: {e}"))));
+                    }
+                };
+                match Worker::new(ui.clone(), api_key, round_start_markers) {
+                    Ok(worker) => rt.block_on(worker.run(cmd_rx)),
+                    Err(e) => ui.send(Event::Notice(Some(format!(
+                        "Failed to start HTTP client: {e}"
+                    )))),
+                }
             }
-        }
-    });
+        });
     if let Err(e) = spawned {
-        ui.send(Event::Notice(Some(format!("Failed to start worker thread: {e}"))));
+        ui.send(Event::Notice(Some(format!(
+            "Failed to start worker thread: {e}"
+        ))));
     }
     (event_rx, cmd_tx)
 }
 
 enum TaskDone {
     /// `ok == false` means a transient failure; the player is re-scheduled on the next tick.
-    Player { puuid: String, ok: bool, cheap_ok: bool, depth: Depth, had_assets: bool },
-    Lookup { query: String, result: Result<Account> },
+    Player {
+        puuid: String,
+        ok: bool,
+        cheap_ok: bool,
+        depth: Depth,
+        had_assets: bool,
+    },
+    Lookup {
+        query: String,
+        result: Result<Account>,
+    },
 }
 
 /// Notices from independent sources are tracked separately so one clearing doesn't hide another.
@@ -100,6 +124,8 @@ struct Worker {
     notices: BTreeMap<NoticeSource, String>,
     roster: Option<Roster>,
     roster_is_core: bool,
+    /// Ignore the preceding match while GLZ catches up to a newly observed agent select.
+    previous_core_id: Option<String>,
     named: HashSet<String>,
     lookup_query: Option<String>,
     lookup_target: Option<(String, String)>,
@@ -108,10 +134,14 @@ struct Worker {
     in_flight: HashSet<String>,
     tasks: JoinSet<TaskDone>,
     round_start_markers: Vec<String>,
-    /// Armed during agent select at the log's end, so the loading screen's lines can be followed.
+    /// Armed once on entering agent select, so a delayed core roster cannot skip round start.
     log_tail: Option<LogTail>,
     /// Set while the loading screen is up.
     loading: Option<(LogTail, Instant)>,
+    /// The log is checked every second without requesting local presence each time.
+    next_presence_at: Instant,
+    /// Ignore a single transient MENUS presence while changing phases.
+    menu_observations: u8,
 }
 
 impl Worker {
@@ -141,6 +171,7 @@ impl Worker {
             notices: BTreeMap::new(),
             roster: None,
             roster_is_core: false,
+            previous_core_id: None,
             named: HashSet::new(),
             lookup_query: None,
             lookup_target: None,
@@ -151,6 +182,8 @@ impl Worker {
             round_start_markers,
             log_tail: None,
             loading: None,
+            next_presence_at: Instant::now(),
+            menu_observations: 0,
         })
     }
 
@@ -197,7 +230,13 @@ impl Worker {
 
     fn task_done(&mut self, done: TaskDone) {
         match done {
-            TaskDone::Player { puuid, ok, cheap_ok, depth, had_assets } => {
+            TaskDone::Player {
+                puuid,
+                ok,
+                cheap_ok,
+                depth,
+                had_assets,
+            } => {
                 if cheap_ok {
                     self.cheap_fetched.insert(puuid.clone(), Instant::now());
                 }
@@ -214,8 +253,14 @@ impl Worker {
             TaskDone::Lookup { query, result } => match result {
                 Ok(account) if self.lookup_query.as_deref() == Some(&query) => {
                     self.named.insert(account.puuid.clone());
-                    self.ui.send(Event::Name { puuid: account.puuid.clone(), riot_id: account.riot_id });
-                    self.ui.send(Event::LookupResolved { query, puuid: account.puuid.clone() });
+                    self.ui.send(Event::Name {
+                        puuid: account.puuid.clone(),
+                        riot_id: account.riot_id,
+                    });
+                    self.ui.send(Event::LookupResolved {
+                        query,
+                        puuid: account.puuid.clone(),
+                    });
                     self.lookup_target = Some((account.puuid.clone(), account.region.clone()));
                     self.schedule(&account.puuid, &account.region);
                 }
@@ -232,13 +277,25 @@ impl Worker {
     }
 
     async fn tick(&mut self) -> Duration {
-        if self.assets.is_none() && Instant::now() >= self.assets_retry_at {
+        // The round-start marker can arrive between presence polls (or during a slow GLZ
+        // request). Follow the local log independently so the overlay disappears promptly.
+        if self.loading.is_some() {
+            if self.poll_loading() == MATCH_POLL {
+                return MATCH_POLL;
+            }
+            if Instant::now() < self.next_presence_at {
+                return LOADING_POLL;
+            }
+        }
+        if self.loading.is_none() && self.assets.is_none() && Instant::now() >= self.assets_retry_at
+        {
             self.load_assets().await;
         }
-
         let Some(session) = self.ensure_session().await else {
             self.set_status(Status::WaitingForClient);
             self.set_roster(None, false);
+            self.log_tail = None;
+            self.menu_observations = 0;
             return IDLE_POLL;
         };
 
@@ -249,38 +306,50 @@ impl Worker {
                 self.session = None;
                 self.set_status(Status::WaitingForClient);
                 self.set_roster(None, false);
+                self.log_tail = None;
+                self.menu_observations = 0;
                 return IDLE_POLL;
             }
         };
+        self.next_presence_at = Instant::now() + MENU_POLL;
+        if state != LoopState::Menus {
+            self.menu_observations = 0;
+        }
 
         let result = match state {
             LoopState::Menus => {
-                self.set_status(Status::InMenu);
-                self.set_roster(None, false);
-                self.log_tail = None;
+                self.menu_observations = self.menu_observations.saturating_add(1);
+                if self.roster.is_none() || self.menu_observations >= 2 {
+                    self.set_status(Status::InMenu);
+                    self.set_roster(None, false);
+                    self.log_tail = None;
+                }
                 Ok(MENU_POLL)
             }
+            LoopState::Pregame if self.roster_is_core && self.loading.is_some() => Ok(LOADING_POLL),
             LoopState::Pregame => match self.poll_pregame(&session).await {
-                // Presence and GLZ briefly disagree around phase transitions.
-                Ok(false) => {
-                    self.set_roster(None, false);
-                    Ok(MENU_POLL)
+                Ok(false) if !self.roster_is_core && self.roster.is_some() => {
+                    // GLZ can remove pregame before it publishes core-game. Keep the old
+                    // layout while probing for the new roster.
+                    self.poll_core(&session).await.map(|_| MENU_POLL)
                 }
+                Ok(false) => Ok(MENU_POLL),
                 r => r.map(|_| MENU_POLL),
             },
-            // Roster loaded: presence leaving INGAME is what ends the match, no remote calls
-            // beyond following the log while the loading screen is up.
-            LoopState::InGame if self.roster_is_core && self.roster.is_some() => Ok(self.poll_loading()),
+            LoopState::InGame if self.roster_is_core && self.roster.is_some() => {
+                Ok(if self.loading.is_some() {
+                    LOADING_POLL
+                } else {
+                    MATCH_POLL
+                })
+            }
             LoopState::InGame => match self.poll_core(&session).await {
-                Ok(false) => {
-                    self.set_roster(None, false);
-                    Ok(MENU_POLL)
-                }
+                Ok(false) => Ok(MENU_POLL),
                 r => r.map(|_| self.poll_loading()),
             },
             LoopState::Unknown => self.poll_unknown(&session).await,
         };
-        match result {
+        let delay = match result {
             Ok(delay) => {
                 self.set_notice(NoticeSource::Riot, None);
                 self.schedule_roster(); // retries transient failures; no-op otherwise
@@ -290,6 +359,11 @@ impl Worker {
                 self.set_notice(NoticeSource::Riot, Some(format!("Riot servers: {e}")));
                 MENU_POLL
             }
+        };
+        if self.loading.is_some() {
+            LOADING_POLL
+        } else {
+            delay
         }
     }
 
@@ -301,14 +375,21 @@ impl Worker {
         }
         if self.session.is_none() {
             let lock = self.lockfile.as_ref()?;
-            let fallback = self.assets.as_ref().and_then(|a| a.client_version.as_deref());
-            match RiotSession::connect(lock, self.local.clone(), self.remote.clone(), fallback).await {
+            let fallback = self
+                .assets
+                .as_ref()
+                .and_then(|a| a.client_version.as_deref());
+            match RiotSession::connect(lock, self.local.clone(), self.remote.clone(), fallback)
+                .await
+            {
                 Ok(s) => {
                     self.session = Some(Arc::new(s));
                     self.set_notice(NoticeSource::Riot, None);
                 }
                 // Not logged in / still booting surfaces as HTTP errors; stay quiet and retry.
-                Err(e @ Error::Missing(_)) => self.set_notice(NoticeSource::Riot, Some(format!("Riot Client: {e}"))),
+                Err(e @ Error::Missing(_)) => {
+                    self.set_notice(NoticeSource::Riot, Some(format!("Riot Client: {e}")))
+                }
                 Err(_) => {}
             }
         }
@@ -317,32 +398,68 @@ impl Worker {
 
     /// Returns whether an agent-select lobby exists.
     async fn poll_pregame(&mut self, session: &RiotSession) -> Result<bool> {
-        let Some(id) = session.pregame_match_id().await? else { return Ok(false) };
-        // Re-read every tick: hovered/locked agents change during selection.
-        let roster = session.pregame_roster(&id).await?;
+        let Some(id) = session.pregame_match_id().await? else {
+            return Ok(false);
+        };
+        if self.roster_is_core && self.roster.as_ref().is_some_and(|r| r.match_id == id) {
+            return Ok(false); // stale pregame presence for the current core match
+        }
+        // Arm before a slow roster request; its latency can span the first buy-phase line.
+        if self.roster_is_core
+            || self.roster.as_ref().is_some_and(|r| r.match_id != id)
+            || self.log_tail.is_none()
+        {
+            self.log_tail = LogTail::game_log_at_end();
+        }
+        // Re-read every tick: hovered/locked agents change during selection. The match
+        // can disappear between the ID and roster requests while transitioning to core.
+        let roster = match session.pregame_roster(&id).await {
+            Ok(roster) => roster,
+            Err(Error::NotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if self.roster_is_core {
+            self.previous_core_id = self.roster.as_ref().map(|r| r.match_id.clone());
+        }
+        self.loading = None;
         self.set_status(Status::AgentSelect);
         self.apply_roster(session, roster, false).await;
-        self.log_tail = LogTail::game_log_at_end();
         Ok(true)
     }
 
     /// Returns whether a loaded match exists. Fetches the roster only for a new match ID.
     async fn poll_core(&mut self, session: &RiotSession) -> Result<bool> {
-        let Some(id) = session.core_match_id().await? else { return Ok(false) };
+        let Some(id) = session.core_match_id().await? else {
+            return Ok(false);
+        };
+        if self.previous_core_id.as_deref() == Some(id.as_str()) {
+            return Ok(false);
+        }
         let known = self.roster_is_core && self.roster.as_ref().is_some_and(|r| r.match_id == id);
         if !known {
-            let roster = session.core_roster(&id).await?;
+            let roster = match session.core_roster(&id).await {
+                Ok(roster) => roster,
+                Err(Error::NotFound) => return Ok(false),
+                Err(e) => return Err(e),
+            };
             self.apply_roster(session, roster, true).await;
+            self.previous_core_id = None;
             // Only a match entered from agent select has a loading screen we watched start.
             self.loading = self.log_tail.take().map(|tail| (tail, Instant::now()));
         }
-        self.set_status(if self.loading.is_some() { Status::Loading } else { Status::LiveMatch });
+        self.set_status(if self.loading.is_some() {
+            Status::Loading
+        } else {
+            Status::LiveMatch
+        });
         Ok(true)
     }
 
     /// Ends the loading phase on the first round-start log line (or after `LOADING_MAX`).
     fn poll_loading(&mut self) -> Duration {
-        let Some((tail, since)) = &mut self.loading else { return MATCH_POLL };
+        let Some((tail, since)) = &mut self.loading else {
+            return MATCH_POLL;
+        };
         if !tail.saw_any(&self.round_start_markers) && since.elapsed() < LOADING_MAX {
             return LOADING_POLL;
         }
@@ -351,16 +468,24 @@ impl Worker {
         MATCH_POLL
     }
 
-    /// Presence was unreadable: ask GLZ directly, the way the original plan polled.
+    /// Presence was unreadable: ask GLZ directly unless an in-game roster is already known.
     async fn poll_unknown(&mut self, session: &RiotSession) -> Result<Duration> {
+        if self.roster_is_core && self.roster.is_some() {
+            return Ok(if self.loading.is_some() {
+                LOADING_POLL
+            } else {
+                MATCH_POLL
+            });
+        }
         if self.poll_core(session).await? {
             return Ok(self.poll_loading());
         }
         if self.poll_pregame(session).await? {
             return Ok(MENU_POLL);
         }
-        self.set_status(Status::InMenu);
-        self.set_roster(None, false);
+        if self.roster.is_none() {
+            self.set_status(Status::InMenu);
+        }
         Ok(MENU_POLL)
     }
 
@@ -374,7 +499,11 @@ impl Worker {
             .filter(|s| !s.hidden && !self.named.contains(&s.puuid))
             .map(|s| s.puuid.as_str())
             .collect();
-        let names = if unnamed.is_empty() { Ok(Vec::new()) } else { session.names(&unnamed).await };
+        let names = if unnamed.is_empty() {
+            Ok(Vec::new())
+        } else {
+            session.names(&unnamed).await
+        };
         self.set_roster(Some(roster), is_core);
         // On failure, unresolved players fall back to a HenrikDev account lookup in their fetch job.
         for (puuid, riot_id) in names.unwrap_or_default() {
@@ -408,12 +537,20 @@ impl Worker {
         if self.in_flight.contains(puuid) {
             return;
         }
-        let cheap_fresh = self.cheap_fetched.get(puuid).is_some_and(|t| t.elapsed() < PLAYER_TTL);
-        if self.fetched.get(puuid).is_some_and(|(t, d)| t.elapsed() < PLAYER_TTL && *d == depth) {
+        let cheap_fresh = self
+            .cheap_fetched
+            .get(puuid)
+            .is_some_and(|t| t.elapsed() < PLAYER_TTL);
+        if self
+            .fetched
+            .get(puuid)
+            .is_some_and(|(t, d)| t.elapsed() < PLAYER_TTL && *d == depth)
+        {
             return;
         }
         self.in_flight.insert(puuid.to_owned());
-        self.fetched.insert(puuid.to_owned(), (Instant::now(), depth));
+        self.fetched
+            .insert(puuid.to_owned(), (Instant::now(), depth));
         let job = PlayerJob {
             session: self.session.clone(),
             henrik: self.henrik.clone(),
@@ -432,11 +569,16 @@ impl Worker {
     }
 
     fn lookup(&mut self, query: String) {
-        let parsed = query.rsplit_once('#').map(|(n, t)| (n.trim().to_owned(), t.trim().to_owned()));
+        let parsed = query
+            .rsplit_once('#')
+            .map(|(n, t)| (n.trim().to_owned(), t.trim().to_owned()));
         self.lookup_query = Some(query.clone());
         self.lookup_target = None;
         let Some((name, tag)) = parsed.filter(|(n, t)| !n.is_empty() && !t.is_empty()) else {
-            return self.ui.send(Event::LookupFailed { query, reason: "Use the format Name#Tag".into() });
+            return self.ui.send(Event::LookupFailed {
+                query,
+                reason: "Use the format Name#Tag".into(),
+            });
         };
         let henrik = self.henrik.clone();
         self.tasks.spawn(async move {
@@ -470,7 +612,9 @@ impl Worker {
         let Some(assets) = &self.assets else {
             return self.icons_waiting.push(key);
         };
-        let Some(url) = assets.icon_url(&key).map(str::to_owned) else { return };
+        let Some(url) = assets.icon_url(&key).map(str::to_owned) else {
+            return;
+        };
         let (http, ui) = (self.remote.clone(), self.ui.clone());
         // Fire-and-forget: a failed icon just renders as an empty slot.
         tokio::spawn(async move {
@@ -491,6 +635,7 @@ impl Worker {
         self.roster_is_core = is_core;
         if roster.is_none() {
             self.loading = None;
+            self.previous_core_id = None;
         }
         if self.roster != roster {
             self.roster = roster.clone();
@@ -500,12 +645,20 @@ impl Worker {
 
     fn set_notice(&mut self, source: NoticeSource, notice: Option<String>) {
         let changed = match notice {
-            Some(msg) => self.notices.insert(source, msg.clone()).is_none_or(|old| old != msg),
+            Some(msg) => self
+                .notices
+                .insert(source, msg.clone())
+                .is_none_or(|old| old != msg),
             None => self.notices.remove(&source).is_some(),
         };
         if changed {
-            let joined = (!self.notices.is_empty())
-                .then(|| self.notices.values().map(String::as_str).collect::<Vec<_>>().join("  ·  "));
+            let joined = (!self.notices.is_empty()).then(|| {
+                self.notices
+                    .values()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("  ·  ")
+            });
             self.ui.send(Event::Notice(joined));
         }
     }
@@ -544,7 +697,10 @@ impl PlayerJob {
 
         if self.need_name {
             match self.henrik.account_by_puuid(&self.puuid).await {
-                Ok(a) => self.ui.send(Event::Name { puuid: self.puuid.clone(), riot_id: a.riot_id }),
+                Ok(a) => self.ui.send(Event::Name {
+                    puuid: self.puuid.clone(),
+                    riot_id: a.riot_id,
+                }),
                 Err(e) => transient |= e.is_transient(),
             }
         }
@@ -560,11 +716,17 @@ impl PlayerJob {
                 Err(_) => self.henrik.rank(&self.region, &self.puuid).await,
             };
             cheap_transient |= rank.as_ref().is_err_and(Error::is_transient);
-            self.ui.send(Event::Rank { puuid: self.puuid.clone(), rank: Fetch::from(rank) });
+            self.ui.send(Event::Rank {
+                puuid: self.puuid.clone(),
+                rank: Fetch::from(rank),
+            });
 
             let stats = self.henrik.stats(&self.region, &self.puuid).await;
             cheap_transient |= stats.as_ref().is_err_and(Error::is_transient);
-            self.ui.send(Event::Stats { puuid: self.puuid.clone(), stats: Fetch::from(stats) });
+            self.ui.send(Event::Stats {
+                puuid: self.puuid.clone(),
+                stats: Fetch::from(stats),
+            });
         }
 
         transient |= self.deep_stats().await;
@@ -585,7 +747,11 @@ impl PlayerJob {
             Some(s) => s.current_act().await.ok(),
             None => None,
         }
-        .or_else(|| self.assets.as_ref().and_then(|a| a.latest_act().map(str::to_owned)));
+        .or_else(|| {
+            self.assets
+                .as_ref()
+                .and_then(|a| a.latest_act().map(str::to_owned))
+        });
         let target0 = depth_from_u8(self.depth.load(Ordering::Relaxed));
         if target0 == Depth::Act && act.is_none() {
             self.unavailable(Depth::Act, "Current act unavailable");
@@ -597,12 +763,16 @@ impl PlayerJob {
         let mut page = match self.fetch_page(0, target0).await {
             Page::Ok(page) => page,
             Page::Failed { transient, reason } => {
-                if matches.is_empty() {
-                    self.unavailable(target0, &reason);
-                } else {
-                    // Unverified cached prefix: show it, capped at the depth it covers.
+                if transient && !matches.is_empty() {
+                    // Keep the cached partial rating while a later tick retries the failed page.
                     let depth = staged_depth(matches.len() as u32, exhausted).min(target0);
                     self.publish(&matches, depth, &act, false, exhausted);
+                    self.ui.send(Event::ImpactProgress {
+                        puuid: self.puuid.clone(),
+                        progress: Progress::Done,
+                    });
+                } else {
+                    self.unavailable(target0, &reason);
                 }
                 return transient;
             }
@@ -631,18 +801,35 @@ impl PlayerJob {
             }
             let have = matches.len() as u32;
             let act_done = act.as_deref().is_some_and(|a| {
-                matches.last().is_some_and(|m| m.act().as_deref().is_some_and(|b| b != a))
+                matches
+                    .last()
+                    .is_some_and(|m| m.act().as_deref().is_some_and(|b| b != a))
             });
             let history_complete = exhausted || act_done;
             let done = history_complete || have >= depth_matches(target);
-            let depth = if done { target } else { staged_depth(have, history_complete).min(target) };
+            let depth = if done {
+                target
+            } else {
+                staged_depth(have, history_complete).min(target)
+            };
             self.publish(&matches, depth, &act, done, history_complete);
             if done {
                 return false;
             }
             page = match self.fetch_page(start, target).await {
                 Page::Ok(page) => page,
-                Page::Failed { transient, .. } => return transient,
+                Page::Failed { transient, reason } => {
+                    if transient {
+                        // The latest verified prefix remains useful; task_done will retry.
+                        self.ui.send(Event::ImpactProgress {
+                            puuid: self.puuid.clone(),
+                            progress: Progress::Done,
+                        });
+                    } else {
+                        self.unavailable(target, &reason);
+                    }
+                    return transient;
+                }
             };
             let page_len = page.len() as u32;
             {
@@ -663,21 +850,35 @@ impl PlayerJob {
             if wait > 0 {
                 self.ui.send(Event::ImpactProgress {
                     puuid: self.puuid.clone(),
-                    progress: Progress::RateLimited { have: start, target, resume_secs: wait },
+                    progress: Progress::RateLimited {
+                        have: start,
+                        target,
+                        resume_secs: wait,
+                    },
                 });
                 tokio::time::sleep(Duration::from_secs(wait.into())).await;
                 continue;
             }
             self.ui.send(Event::ImpactProgress {
                 puuid: self.puuid.clone(),
-                progress: Progress::Fetching { have: start, target },
+                progress: Progress::Fetching {
+                    have: start,
+                    target,
+                },
             });
-            return match self.henrik.recent_matches(&self.region, &self.puuid, start).await {
+            return match self
+                .henrik
+                .recent_matches(&self.region, &self.puuid, start)
+                .await
+            {
                 Ok(page) => {
                     self.report_quota();
                     Page::Ok(page)
                 }
-                Err(e) => Page::Failed { transient: e.is_transient(), reason: e.to_string() },
+                Err(e) => Page::Failed {
+                    transient: e.is_transient(),
+                    reason: e.to_string(),
+                },
             };
         }
     }
@@ -688,20 +889,36 @@ impl PlayerJob {
             depth,
             impact: Fetch::Unavailable(reason.to_owned()),
         });
-        self.ui.send(Event::ImpactProgress { puuid: self.puuid.clone(), progress: Progress::Done });
+        self.ui.send(Event::ImpactProgress {
+            puuid: self.puuid.clone(),
+            progress: Progress::Done,
+        });
     }
-
 
     /// Rates the player over `matches` (trimmed to `depth`), updates the model, and publishes.
     /// `complete` marks that nothing older is known to exist for this player.
-    fn publish(&self, matches: &[Arc<MatchDto>], depth: Depth, act: &Option<String>, done: bool, complete: bool) {
+    fn publish(
+        &self,
+        matches: &[Arc<MatchDto>],
+        depth: Depth,
+        act: &Option<String>,
+        done: bool,
+        complete: bool,
+    ) {
         let scope: Vec<Arc<MatchDto>> = match depth {
             Depth::Act => matches
                 .iter()
-                .filter(|m| act.as_deref().is_some_and(|a| m.act().as_deref() == Some(a)))
+                .filter(|m| {
+                    act.as_deref()
+                        .is_some_and(|a| m.act().as_deref() == Some(a))
+                })
                 .cloned()
                 .collect(),
-            d => matches.iter().take(depth_matches(d) as usize).cloned().collect(),
+            d => matches
+                .iter()
+                .take(depth_matches(d) as usize)
+                .cloned()
+                .collect(),
         };
         let impact = {
             let mut model = self.win_model.lock();
@@ -719,13 +936,19 @@ impl PlayerJob {
             impact: Fetch::from(impact.ok_or(Error::NotFound)),
         });
         if done {
-            self.ui.send(Event::ImpactProgress { puuid: self.puuid.clone(), progress: Progress::Done });
+            self.ui.send(Event::ImpactProgress {
+                puuid: self.puuid.clone(),
+                progress: Progress::Done,
+            });
         }
     }
 
     fn report_quota(&self) {
         if let Some(q) = self.henrik.quota() {
-            self.ui.send(Event::Quota { remaining: q.remaining, reset_secs: q.reset_secs });
+            self.ui.send(Event::Quota {
+                remaining: q.remaining,
+                reset_secs: q.reset_secs,
+            });
         }
     }
 }
@@ -752,7 +975,10 @@ fn staged_depth(have: u32, history_complete: bool) -> Depth {
 fn prefix_matches(matches: &[Arc<MatchDto>], page: &[MatchDto]) -> bool {
     !page.is_empty()
         && matches.len() >= page.len()
-        && matches.iter().zip(page).all(|(old, new)| old.id() == new.id())
+        && matches
+            .iter()
+            .zip(page)
+            .all(|(old, new)| old.id() == new.id())
 }
 
 fn depth_from_u8(v: u8) -> Depth {
@@ -776,7 +1002,10 @@ mod tests {
     use super::*;
 
     fn dto(id: &str) -> MatchDto {
-        serde_json::from_str(&format!(r#"{{"metadata":{{"match_id":"{id}"}},"players":[]}}"#)).unwrap()
+        serde_json::from_str(&format!(
+            r#"{{"metadata":{{"match_id":"{id}"}},"players":[]}}"#
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -795,9 +1024,13 @@ mod tests {
         let same: Vec<Arc<MatchDto>> = page.iter().map(|m| Arc::new(dto(m.id()))).collect();
         assert!(prefix_matches(&same, &page));
         // A page that disagrees about what the newest matches are breaks the chain.
-        let reordered: Vec<Arc<MatchDto>> = page.iter().rev().map(|m| Arc::new(dto(m.id()))).collect();
+        let reordered: Vec<Arc<MatchDto>> =
+            page.iter().rev().map(|m| Arc::new(dto(m.id()))).collect();
         assert!(!prefix_matches(&reordered, &page));
-        assert!(!prefix_matches(&[], &page), "an empty cache never confirms anything");
+        assert!(
+            !prefix_matches(&[], &page),
+            "an empty cache never confirms anything"
+        );
         assert!(!prefix_matches(&same, &[]), "an empty page proves nothing");
     }
 
@@ -819,5 +1052,50 @@ mod tests {
         for d in [Depth::Last10, Depth::Last20, Depth::Act] {
             assert_eq!(depth_from_u8(depth_to_u8(d)), d);
         }
+    }
+    #[test]
+    fn loading_overlay_hides_on_first_new_round_marker() {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "vltracker-loading-{}-{nonce}.log",
+            std::process::id()
+        ));
+        std::fs::write(&path, "Gameplay started at local time (previous match)\n").unwrap();
+        let tail = LogTail::at_end(path.clone()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            UiSink::new(tx, egui::Context::default()),
+            String::new(),
+            vec!["Gameplay started at local time".into()],
+        )
+        .unwrap();
+        worker.status = Some(Status::Loading);
+        worker.loading = Some((tail, Instant::now()));
+        assert_eq!(worker.poll_loading(), LOADING_POLL);
+        assert!(
+            rx.try_recv().is_err(),
+            "old log lines must not hide the overlay"
+        );
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        log.write_all(b"Gameplay started at local time (first buy phase)\n")
+            .unwrap();
+        assert_eq!(worker.poll_loading(), MATCH_POLL);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::Status(Status::LiveMatch))
+        ));
+        assert!(worker.loading.is_none());
+        std::fs::remove_file(path).unwrap();
     }
 }

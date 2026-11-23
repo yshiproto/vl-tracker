@@ -22,7 +22,12 @@ fn percent(part: u32, whole: u32) -> f32 {
 /// Small heading with a rule under it.
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
-    ui.label(RichText::new(title).small().strong().color(Color32::from_gray(150)));
+    ui.label(
+        RichText::new(title)
+            .small()
+            .strong()
+            .color(Color32::from_gray(150)),
+    );
     ui.separator();
 }
 
@@ -35,31 +40,59 @@ struct Row {
 }
 
 fn row(label: &'static str, value: String, hint: &'static str) -> Row {
-    Row { label, value, hint, lead: false }
+    Row {
+        label,
+        value,
+        hint,
+        lead: false,
+    }
 }
 
 fn rows_grid(ui: &mut egui::Ui, id: &str, rows: &[Row]) {
-    egui::Grid::new(id).num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
-        for r in rows {
-            let label = RichText::new(r.label).color(Color32::from_gray(if r.lead { 220 } else { 160 }));
-            let value = RichText::new(&r.value);
-            let (label, value) = if r.lead { (label.strong(), value.strong()) } else { (label, value) };
-            let l = ui.label(label);
-            let v = ui.label(value);
-            if !r.hint.is_empty() {
-                l.on_hover_text(r.hint);
-                v.on_hover_text(r.hint);
+    const LABEL_WIDTH: f32 = 116.0;
+    const VALUE_WIDTH: f32 = CARD_WIDTH - LABEL_WIDTH - 8.0;
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([8.0, 3.0])
+        .show(ui, |ui| {
+            for r in rows {
+                let label = RichText::new(r.label).color(Color32::from_gray(if r.lead {
+                    220
+                } else {
+                    160
+                }));
+                let value = RichText::new(&r.value);
+                let (label, value) = if r.lead {
+                    (label.strong(), value.strong())
+                } else {
+                    (label, value)
+                };
+                let label = ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new(label).truncate());
+                let value = ui.add_sized([VALUE_WIDTH, 18.0], egui::Label::new(value).truncate());
+                if !r.hint.is_empty() {
+                    label.on_hover_text(r.hint);
+                    value.on_hover_text(format!("{}\n\n{}", r.value, r.hint));
+                } else {
+                    value.on_hover_text(&r.value);
+                }
+                ui.end_row();
             }
-            ui.end_row();
-        }
-    });
+        });
 }
 
 impl App {
     /// The full card for one player. Missing data shows as a short status line per section.
     pub(crate) fn detail_card(&mut self, ui: &mut egui::Ui, puuid: &str) {
         ui.set_width(CARD_WIDTH);
-        let Some(PlayerInfo { riot_id, rank, stats, impact, impact_depth, progress }) = self.players.get(puuid).cloned()
+        let Some(PlayerInfo {
+            riot_id,
+            rank,
+            stats,
+            impact,
+            impact_depth,
+            progress,
+            progress_at,
+        }) = self.players.get(puuid).cloned()
         else {
             ui.label(RichText::new("No data for this player yet").weak());
             return;
@@ -70,10 +103,12 @@ impl App {
         self.rank_section(ui, &rank);
 
         match &impact {
-            Fetch::Ready(i) => self.impact_section(ui, i, impact_depth, progress.as_ref()),
+            Fetch::Ready(i) => {
+                self.impact_section(ui, i, impact_depth, progress.as_ref(), progress_at)
+            }
             Fetch::Pending => {
                 section(ui, "IMPACT");
-                ui.label(RichText::new(progress_text(progress.as_ref(), 0)).weak());
+                ui.label(RichText::new(progress_text(progress.as_ref(), progress_at)).weak());
             }
             Fetch::Unavailable(reason) => {
                 section(ui, "IMPACT");
@@ -91,13 +126,29 @@ impl App {
         if let Fetch::Ready(profile) = rank
             && let Some((tier, act)) = self.peak(profile)
         {
-            rows.push(row("Peak", format!("{} ({act})", self.tier_label(tier)), "Highest tier with a win, across all acts"));
+            rows.push(row(
+                "Peak",
+                format!("{} ({act})", self.tier_label(tier)),
+                "Highest tier with a win, across all acts",
+            ));
         }
         rows_grid(ui, "rank_rows", &rows);
     }
 
-    fn impact_section(&self, ui: &mut egui::Ui, i: &Impact, depth: Depth, progress: Option<&Progress>) {
-        let scope = format!("{} MATCHES", depth.scope(i.matches, i.history_complete).to_ascii_uppercase());
+    fn impact_section(
+        &self,
+        ui: &mut egui::Ui,
+        i: &Impact,
+        depth: Depth,
+        progress: Option<&Progress>,
+        progress_at: Option<std::time::Instant>,
+    ) {
+        let scope = format!(
+            "{} MATCHES",
+            depth
+                .scope(i.matches, i.history_complete)
+                .to_ascii_uppercase()
+        );
         section(ui, &format!("IMPACT · {scope}"));
         let (label, color) = impact_label(i.rating);
         let agent = i.main_agent.as_deref();
@@ -107,7 +158,12 @@ impl App {
         egui::Sides::new().show(
             ui,
             |ui| {
-                ui.label(RichText::new(format!("{:.2}", i.rating)).strong().size(20.0).color(color));
+                ui.label(
+                    RichText::new(format!("{:.2}", i.rating))
+                        .strong()
+                        .size(20.0)
+                        .color(color),
+                );
                 ui.label(RichText::new(label).strong().color(color));
             },
             |ui| {
@@ -126,12 +182,20 @@ impl App {
             .weak(),
         );
         if !matches!(progress, None | Some(Progress::Done)) {
-            ui.label(RichText::new(progress_text(progress, i.matches)).small().color(Color32::from_rgb(230, 170, 90)));
+            ui.label(
+                RichText::new(progress_text(progress, progress_at))
+                    .small()
+                    .color(Color32::from_rgb(230, 170, 90)),
+            );
         }
         if !i.recent_rounds.is_empty() {
             ui.add_space(4.0);
             round_strip(ui, &i.recent_rounds);
-            ui.label(RichText::new("Round by round, last 2 matches (hover a bar)").small().weak());
+            ui.label(
+                RichText::new("Round by round, last 2 matches (hover a bar)")
+                    .small()
+                    .weak(),
+            );
         }
         ui.add_space(4.0);
 
@@ -155,7 +219,10 @@ impl App {
             ),
             row(
                 "Consistency",
-                format!("{steadiness} (match-to-match ±{:.1}%)", i.consistency_sd * 100.0),
+                format!(
+                    "{steadiness} (match-to-match ±{:.1}%)",
+                    i.consistency_sd * 100.0
+                ),
                 "Spread of per-match impact. Streaky players carry some games and sink others",
             ),
             row(
@@ -189,9 +256,21 @@ impl App {
                 format!("{} won · {} lost", i.opening_wins, i.opening_losses),
                 "First kill of the round: taken or given up",
             ),
-            row("KAST", format!("{:.0}%", i.kast * 100.0), "Rounds with a kill, assist, survival or traded death"),
-            row("Clutches", format!("{} won of {}", i.clutches_won, i.clutches), "Rounds left as the last player alive against two or more"),
-            row("Impact frags", i.impact_frags.to_string(), "Kills after the opening duel that swung the round by 25+ points"),
+            row(
+                "KAST",
+                format!("{:.0}%", i.kast * 100.0),
+                "Rounds with a kill, assist, survival or traded death",
+            ),
+            row(
+                "Clutches",
+                format!("{} won of {}", i.clutches_won, i.clutches),
+                "Rounds left as the last player alive against two or more",
+            ),
+            row(
+                "Impact frags",
+                i.impact_frags.to_string(),
+                "Kills after the opening duel that swung the round by 25+ points",
+            ),
         ];
         let mut trading = vec![
             row(
@@ -201,7 +280,12 @@ impl App {
             ),
             row(
                 "Deaths traded",
-                format!("{} of {} ({:.0}%)", i.deaths_traded, i.deaths, percent(i.deaths_traded, i.deaths)),
+                format!(
+                    "{} of {} ({:.0}%)",
+                    i.deaths_traded,
+                    i.deaths,
+                    percent(i.deaths_traded, i.deaths)
+                ),
                 "Deaths avenged by a teammate within 5 s",
             ),
             row(
@@ -211,7 +295,11 @@ impl App {
             ),
         ];
         let mut utility = vec![
-            row("Util assists", i.util_assists.to_string(), "Assists on players they never damaged that round: flashes, debuffs"),
+            row(
+                "Util assists",
+                i.util_assists.to_string(),
+                "Assists on players they never damaged that round: flashes, debuffs",
+            ),
             row(
                 "Casts per round",
                 match i.agent_casts_per_round {
@@ -237,7 +325,11 @@ impl App {
                 "The attackers' first fight inside a site before the plant",
             ));
             if let Some(spot) = &i.entry_spot {
-                entries.push(row("Usual entry", spot.clone(), "Most common callout of their entry kills"));
+                entries.push(row(
+                    "Usual entry",
+                    spot.clone(),
+                    "Most common callout of their entry kills",
+                ));
             }
         }
         let mut lurks = Vec::new();
@@ -278,7 +370,12 @@ impl App {
         if i.kills > 0 {
             rows.push(row(
                 "Low-impact kills",
-                format!("{} of {} ({:.0}%)", i.low_impact_kills, i.kills, percent(i.low_impact_kills, i.kills)),
+                format!(
+                    "{} of {} ({:.0}%)",
+                    i.low_impact_kills,
+                    i.kills,
+                    percent(i.low_impact_kills, i.kills)
+                ),
                 "Kills that moved round-win odds by under 3 points: exit frags, eco kills",
             ));
         }
@@ -297,14 +394,17 @@ impl App {
             return;
         }
         section(ui, "RECENT ACTS");
-        egui::Grid::new("act_rows").num_columns(3).spacing([14.0, 3.0]).show(ui, |ui| {
-            for (label, tier, wins, games) in acts {
-                ui.label(RichText::new(label).color(Color32::from_gray(160)));
-                ui.label(self.tier_label(tier));
-                ui.label(RichText::new(format!("{wins} won of {games}")).weak());
-                ui.end_row();
-            }
-        });
+        egui::Grid::new("act_rows")
+            .num_columns(3)
+            .spacing([14.0, 3.0])
+            .show(ui, |ui| {
+                for (label, tier, wins, games) in acts {
+                    ui.label(RichText::new(label).color(Color32::from_gray(160)));
+                    ui.label(self.tier_label(tier));
+                    ui.label(RichText::new(format!("{wins} won of {games}")).weak());
+                    ui.end_row();
+                }
+            });
     }
 
     pub(crate) fn rank_text(&self, rank: &Fetch<RankProfile>) -> String {
@@ -317,7 +417,10 @@ impl App {
     }
 
     pub(crate) fn tier_label(&self, tier: u32) -> String {
-        self.assets.as_ref().and_then(|a| a.tier_name(tier)).map_or_else(|| format!("Tier {tier}"), str::to_owned)
+        self.assets
+            .as_ref()
+            .and_then(|a| a.tier_name(tier))
+            .map_or_else(|| format!("Tier {tier}"), str::to_owned)
     }
 
     /// Highest tier across all acts (normalized to the current table) and the act it was reached in.
@@ -334,7 +437,9 @@ impl App {
 
     /// Newest acts first: (label, final tier normalized, wins, games).
     fn recent_acts(&self, profile: &RankProfile, n: usize) -> Vec<(String, u32, u32, u32)> {
-        let Some(assets) = &self.assets else { return Vec::new() };
+        let Some(assets) = &self.assets else {
+            return Vec::new();
+        };
         let mut acts: Vec<_> = profile.acts.iter().collect();
         acts.sort_by(|a, b| {
             let start = |x: &str| assets.acts.get(x).map(|a| a.start.as_str()).unwrap_or("");
@@ -342,28 +447,45 @@ impl App {
         });
         acts.into_iter()
             .take(n)
-            .map(|a| (self.act_label(&a.act), assets.normalize_tier(&a.act, a.tier), a.wins, a.games))
+            .map(|a| {
+                (
+                    self.act_label(&a.act),
+                    assets.normalize_tier(&a.act, a.tier),
+                    a.wins,
+                    a.games,
+                )
+            })
             .collect()
     }
 
     fn act_label(&self, act: &str) -> String {
-        self.assets.as_ref().and_then(|a| a.acts.get(act)).map_or_else(|| "Unknown act".into(), |a| a.label.clone())
+        self.assets
+            .as_ref()
+            .and_then(|a| a.acts.get(act))
+            .map_or_else(|| "Unknown act".into(), |a| a.label.clone())
     }
 }
 
 /// One line describing where a player's deep fetch stands.
-fn progress_text(progress: Option<&Progress>, have_now: u32) -> String {
+fn progress_text(progress: Option<&Progress>, at: Option<std::time::Instant>) -> String {
     match progress {
         None => "Queued for match history…".into(),
         Some(Progress::Done) => String::new(),
         Some(Progress::Fetching { have, target }) => {
-            let have = (*have).max(have_now);
-            format!("Fetching match history… {have} so far, target: {}", target.label().to_lowercase())
-        }
-        Some(Progress::RateLimited { have, target, resume_secs }) => {
-            let have = (*have).max(have_now);
             format!(
-                "Waiting {resume_secs}s for API quota ({have} so far, target: {})",
+                "Fetching match history… {have} so far, target: {}",
+                target.label().to_lowercase()
+            )
+        }
+        Some(Progress::RateLimited {
+            have,
+            target,
+            resume_secs,
+        }) => {
+            let remaining =
+                resume_secs.saturating_sub(at.map_or(0, |at| at.elapsed().as_secs() as u32));
+            format!(
+                "Waiting {remaining}s for API quota ({have} so far, target: {})",
                 target.label().to_lowercase()
             )
         }
@@ -375,8 +497,21 @@ fn stats_section(ui: &mut egui::Ui, stats: &Fetch<Stats>) {
         Fetch::Ready(s) => {
             section(ui, &format!("LAST {} COMPETITIVE", s.matches));
             let rows = [
-                row("Win rate", format!("{:.0}% ({} won · {} lost)", percent(s.wins, s.wins + s.losses), s.wins, s.losses), ""),
-                row("ACS / ADR", format!("{:.0} / {:.0}", s.acs, s.adr), "Average combat score and damage per round"),
+                row(
+                    "Win rate",
+                    format!(
+                        "{:.0}% ({} won · {} lost)",
+                        percent(s.wins, s.wins + s.losses),
+                        s.wins,
+                        s.losses
+                    ),
+                    "",
+                ),
+                row(
+                    "ACS / ADR",
+                    format!("{:.0} / {:.0}", s.acs, s.adr),
+                    "Average combat score and damage per round",
+                ),
                 row("K/D · HS%", format!("{:.2} · {:.0}%", s.kd, s.hs_pct), ""),
             ];
             rows_grid(ui, "stats_rows", &rows);
@@ -395,13 +530,22 @@ fn stats_section(ui: &mut egui::Ui, stats: &Fetch<Stats>) {
 /// One bar per round (oldest left): up = round-win chance added, down = lost. A tick under each
 /// bar marks rounds the team won; a gap separates matches. Hover for the round.
 fn round_strip(ui: &mut egui::Ui, rounds: &[RoundSwing]) {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(CARD_WIDTH, STRIP_HEIGHT), Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(CARD_WIDTH, STRIP_HEIGHT), Sense::hover());
     let painter = ui.painter_at(rect);
-    let gaps = rounds.iter().filter(|r| r.match_start).count().saturating_sub(1) as f32;
+    let gaps = rounds
+        .iter()
+        .filter(|r| r.match_start)
+        .count()
+        .saturating_sub(1) as f32;
     let slot = ((rect.width() - gaps * 4.0) / rounds.len() as f32).min(10.0);
     let mid = rect.center().y - 3.0;
     let half = STRIP_HEIGHT / 2.0 - 5.0;
-    painter.hline(rect.x_range(), mid, egui::Stroke::new(1.0, Color32::from_white_alpha(30)));
+    painter.hline(
+        rect.x_range(),
+        mid,
+        egui::Stroke::new(1.0, Color32::from_white_alpha(30)),
+    );
 
     let mut x = rect.left();
     let mut hovered = None;
@@ -415,21 +559,49 @@ fn round_strip(ui: &mut egui::Ui, rounds: &[RoundSwing]) {
         }
         round_no += 1;
         let height = (r.swing.abs() / 0.5).min(1.0) * half;
-        let (top, bottom) = if r.swing >= 0.0 { (mid - height, mid) } else { (mid, mid + height) };
-        let color = if r.swing >= 0.0 { Color32::from_rgb(90, 210, 120) } else { Color32::from_rgb(230, 110, 100) };
-        let bar = Rect::from_min_max(Pos2::new(x + 1.0, top), Pos2::new(x + slot - 1.0, bottom.max(top + 1.0)));
+        let (top, bottom) = if r.swing >= 0.0 {
+            (mid - height, mid)
+        } else {
+            (mid, mid + height)
+        };
+        let color = if r.swing >= 0.0 {
+            Color32::from_rgb(90, 210, 120)
+        } else {
+            Color32::from_rgb(230, 110, 100)
+        };
+        let bar = Rect::from_min_max(
+            Pos2::new(x + 1.0, top),
+            Pos2::new(x + slot - 1.0, bottom.max(top + 1.0)),
+        );
         painter.rect_filled(bar, 1.0, color);
-        let tick = if r.won { Color32::from_white_alpha(140) } else { Color32::from_white_alpha(25) };
-        let tick_rect = Rect::from_min_max(Pos2::new(x + 1.0, rect.bottom() - 3.0), Pos2::new(x + slot - 1.0, rect.bottom()));
+        let tick = if r.won {
+            Color32::from_white_alpha(140)
+        } else {
+            Color32::from_white_alpha(25)
+        };
+        let tick_rect = Rect::from_min_max(
+            Pos2::new(x + 1.0, rect.bottom() - 3.0),
+            Pos2::new(x + slot - 1.0, rect.bottom()),
+        );
         painter.rect_filled(tick_rect, 0.0, tick);
-        if response.hover_pos().is_some_and(|p| p.x >= x && p.x < x + slot) {
+        if response
+            .hover_pos()
+            .is_some_and(|p| p.x >= x && p.x < x + slot)
+        {
             hovered = Some((round_no, r));
         }
         x += slot;
     }
     if let Some((n, r)) = hovered {
-        let mut parts = vec![format!("Round {n}: {:+.1}%", r.swing * 100.0), plural(r.kills.into(), "kill", "kills")];
-        for (flag, label) in [(r.died, "died"), (r.planted, "planted"), (r.defused, "defused")] {
+        let mut parts = vec![
+            format!("Round {n}: {:+.1}%", r.swing * 100.0),
+            plural(r.kills.into(), "kill", "kills"),
+        ];
+        for (flag, label) in [
+            (r.died, "died"),
+            (r.planted, "planted"),
+            (r.defused, "defused"),
+        ] {
             if flag {
                 parts.push(label.into());
             }
@@ -454,3 +626,26 @@ fn impact_note(i: &Impact) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn quota_wait_counts_down_from_last_worker_update() {
+        let progress = Progress::RateLimited {
+            have: 10,
+            target: Depth::Last20,
+            resume_secs: 30,
+        };
+        let at = Instant::now() - Duration::from_secs(5);
+        assert!(
+            progress_text(Some(&progress), Some(at))
+                .starts_with("Waiting 25s for API quota (10 so far")
+        );
+        let expired = Instant::now() - Duration::from_secs(31);
+        assert!(
+            progress_text(Some(&progress), Some(expired)).starts_with("Waiting 0s for API quota")
+        );
+    }
+}
